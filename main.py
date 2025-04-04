@@ -2,7 +2,7 @@ import os
 import asyncio
 import getpass
 from telethon.sync import TelegramClient
-from telethon.errors import SessionPasswordNeededError, FloodWaitError
+from telethon.errors import SessionPasswordNeededError, FloodWaitError, PhoneNumberInvalidError
 from telethon.tl.functions.auth import GetAuthorizationsRequest
 from telethon.tl.functions.account import UpdateProfileRequest
 from telethon.tl.functions.contacts import DeleteContactsRequest
@@ -34,33 +34,64 @@ def get_session_name(phone):
     return f"session_{phone.replace('+', '')}.session"
 
 async def create_session():
-    """Create a new Telegram session"""
-    phone = input(f"{Theme.PRIMARY}📞 Enter your phone number (or bot token): {Theme.RESET}").strip()
+    """Create a new Telegram session with improved handling"""
+    while True:
+        phone = input(f"{Theme.PRIMARY}📞 Enter your phone number (e.g., +12345678900) or bot token: {Theme.RESET}").strip()
+        if not phone:
+            print(f"{Theme.ERROR}❌ Phone number cannot be empty. Please try again.{Theme.RESET}")
+            continue
+        if not phone.startswith('+') and not phone.isalnum():  # Basic bot token check
+            print(f"{Theme.ERROR}❌ Invalid format. Use + followed by country code and number, or a valid bot token.{Theme.RESET}")
+            continue
+        break
+    
     session_name = get_session_name(phone)
     
     async with TelegramClient(session_name, API_ID, API_HASH) as client:
-        await client.connect()
-        
-        if not await client.is_user_authorized():
+        for attempt in range(3):
             try:
-                await client.send_code_request(phone)
-                code = input(f"{Theme.WARNING}🔑 Enter the code you received: {Theme.RESET}").strip()
-                await client.sign_in(phone, code)
+                await client.connect()
+                if not await client.is_user_authorized():
+                    print(f"{Theme.INFO}ℹ️ Sending verification code to {phone}...{Theme.RESET}")
+                    await client.send_code_request(phone)
+                    code = input(f"{Theme.WARNING}🔑 Enter the code you received (or 'q' to quit): {Theme.RESET}").strip()
+                    if code.lower() == 'q':
+                        print(f"{Theme.WARNING}ℹ️ Session creation cancelled.{Theme.RESET}")
+                        return
+                    
+                    await client.sign_in(phone, code)
+                
+                print(f"{Theme.SUCCESS}✅ Signed in successfully! Session saved as {session_name}{Theme.RESET}")
+                return session_name
+            
             except SessionPasswordNeededError:
-                password = getpass.getpass(f"{Theme.ERROR}🔒 Enter your 2FA password: {Theme.RESET}")
-                await client.sign_in(password=password)
-            except Exception as e:
-                print(f"{Theme.ERROR}❌ Error during sign-in: {str(e)}{Theme.RESET}")
+                for pwd_attempt in range(3):
+                    password = getpass.getpass(f"{Theme.ERROR}🔒 Enter your 2FA password (attempt {pwd_attempt + 1}/3): {Theme.RESET}")
+                    try:
+                        await client.sign_in(password=password)
+                        print(f"{Theme.SUCCESS}✅ Signed in successfully! Session saved as {session_name}{Theme.RESET}")
+                        return session_name
+                    except Exception as e:
+                        print(f"{Theme.ERROR}❌ Invalid password: {str(e)}. Please try again.{Theme.RESET}")
+                        if pwd_attempt == 2:
+                            print(f"{Theme.ERROR}❌ Maximum password attempts reached.{Theme.RESET}")
+                            return
+            except PhoneNumberInvalidError:
+                print(f"{Theme.ERROR}❌ The phone number is invalid. Please check the format and try again.{Theme.RESET}")
                 return
-        
-        print(f"{Theme.SUCCESS}✅ Signed in successfully! Session saved as {session_name}{Theme.RESET}")
-        return session_name
+            except TimeoutError:
+                print(f"{Theme.WARNING}⏳ Connection timeout (attempt {attempt + 1}/3). Retrying...{Theme.RESET}")
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+            except Exception as e:
+                print(f"{Theme.ERROR}❌ Failed to create session: {str(e)}{Theme.RESET}")
+                return
+        print(f"{Theme.ERROR}❌ Failed to connect after 3 attempts. Check your network or API credentials.{Theme.RESET}")
 
 def list_sessions():
     """List all saved session files"""
     sessions = [f for f in os.listdir() if f.startswith("session_") and f.endswith(".session")]
     if not sessions:
-        print(f"{Theme.ERROR}❌ No saved sessions found.{Theme.RESET}")
+        print(f"{Theme.WARNING}ℹ️ No saved sessions found.{Theme.RESET}")
         return None
     
     print(f"{Theme.INFO}\nAvailable Sessions:{Theme.RESET}")
@@ -74,14 +105,18 @@ def select_session():
     if not sessions:
         return None
     
-    try:
-        choice = int(input(f"{Theme.PRIMARY}\nSelect a session number: {Theme.RESET}").strip()) - 1
-        if 0 <= choice < len(sessions):
-            return sessions[choice]
-        print(f"{Theme.ERROR}❌ Invalid selection. Please choose a number between 1 and {len(sessions)}.{Theme.RESET}")
-    except ValueError:
-        print(f"{Theme.ERROR}❌ Please enter a valid number.{Theme.RESET}")
-    return None
+    while True:
+        try:
+            choice = input(f"{Theme.PRIMARY}\nSelect a session number (1-{len(sessions)}): {Theme.RESET}").strip()
+            if not choice:
+                print(f"{Theme.ERROR}❌ Selection cannot be empty.{Theme.RESET}")
+                continue
+            choice = int(choice) - 1
+            if 0 <= choice < len(sessions):
+                return sessions[choice]
+            print(f"{Theme.ERROR}❌ Invalid selection. Choose a number between 1 and {len(sessions)}.{Theme.RESET}")
+        except ValueError:
+            print(f"{Theme.ERROR}❌ Please enter a valid number.{Theme.RESET}")
 
 async def terminate_other_sessions():
     """Terminate all sessions except current one"""
@@ -108,6 +143,9 @@ async def show_active_sessions():
         await client.connect()
         try:
             auths = await client(GetAuthorizationsRequest())
+            if not auths.authorizations:
+                print(f"{Theme.WARNING}ℹ️ No active sessions found.{Theme.RESET}")
+                return
             print(f"{Theme.INFO}📊 Active Sessions ({len(auths.authorizations)}):{Theme.RESET}")
             for i, auth in enumerate(auths.authorizations, 1):
                 print(f"{Theme.INFO}{i}. Device: {auth.device_model} ({auth.platform})")
@@ -169,7 +207,7 @@ async def delete_chat():
             for i, dialog in enumerate(dialogs, 1):
                 print(f"{Theme.INFO}{i}. {dialog.title}{Theme.RESET}")
             
-            choice = int(input(f"{Theme.PRIMARY}Select chat number to delete: {Theme.RESET}").strip()) - 1
+            choice = int(input(f"{Theme.PRIMARY}Select chat number to delete (1-{len(dialogs)}): {Theme.RESET}").strip()) - 1
             if 0 <= choice < len(dialogs):
                 await client(DeleteChatRequest(chat_id=dialogs[choice].id))
                 print(f"{Theme.SUCCESS}✅ Chat '{dialogs[choice].title}' deleted.{Theme.RESET}")
@@ -192,7 +230,6 @@ async def check_spam_status():
             ttl = await client(GetAccountTTLRequest())
             print(f"{Theme.INFO}📋 Account Status:{Theme.RESET}")
             print(f"{Theme.INFO}   Account TTL: {ttl.days} days")
-            # Simple spam check (this is limited as Telegram doesn't expose full spam status)
             test_msg = await client.send_message("me", "Spam check test")
             await client.delete_messages("me", [test_msg.id])
             print(f"{Theme.SUCCESS}✅ Account appears unrestricted (can send messages).{Theme.RESET}")
@@ -252,18 +289,18 @@ async def main():
         for key, (desc, _) in menu_options.items():
             print(f"{Theme.MENU}{key}. {desc}{Theme.RESET}")
         
-        choice = input(f"{Theme.PRIMARY}👉 Enter your choice: {Theme.RESET}").strip()
+        choice = input(f"{Theme.PRIMARY}👉 Enter your choice (1-{len(menu_options)}): {Theme.RESET}").strip()
         
         if choice in menu_options:
             if choice == "10":
-                print(f"{Theme.SUCCESS}👋 Exiting...{Theme.RESET}")
+                print(f"{Theme.SUCCESS}👋 Exiting Telegram Session Manager...{Theme.RESET}")
                 break
             elif choice == "2":
                 menu_options[choice][1]()
             else:
                 await safe_execute(menu_options[choice][1])
         else:
-            print(f"{Theme.ERROR}❌ Invalid choice! Please select 1-{len(menu_options)}.{Theme.RESET}")
+            print(f"{Theme.ERROR}❌ Invalid choice! Please select a number between 1 and {len(menu_options)}.{Theme.RESET}")
 
 if __name__ == "__main__":
     asyncio.run(main())
