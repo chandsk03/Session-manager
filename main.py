@@ -3,8 +3,11 @@ import asyncio
 import getpass
 from telethon.sync import TelegramClient
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
-from telethon.tl.functions.auth import ResetAuthorizationsRequest
+from telethon.tl.functions.auth import GetAuthorizationsRequest
 from telethon.tl.functions.account import UpdateProfileRequest
+from telethon.tl.functions.contacts import DeleteContactsRequest
+from telethon.tl.functions.messages import DeleteChatRequest
+from telethon.tl.functions.account import GetAccountTTLRequest
 from colorama import Fore, Style, init
 import time
 
@@ -89,13 +92,14 @@ async def terminate_other_sessions():
     async with TelegramClient(session, API_ID, API_HASH) as client:
         await client.connect()
         try:
+            await client(GetAuthorizationsRequest())
             await client(ResetAuthorizationsRequest())
             print(f"{Theme.SUCCESS}✅ All other sessions terminated successfully.{Theme.RESET}")
         except Exception as e:
             print(f"{Theme.ERROR}❌ Failed to terminate sessions: {str(e)}{Theme.RESET}")
 
-async def check_active_sessions():
-    """Check active sessions and display count"""
+async def show_active_sessions():
+    """Show detailed info about active sessions"""
     session = select_session()
     if not session:
         return
@@ -103,26 +107,16 @@ async def check_active_sessions():
     async with TelegramClient(session, API_ID, API_HASH) as client:
         await client.connect()
         try:
-            dialogs = await client.get_dialogs()
-            print(f"{Theme.INFO}📊 Active Sessions Count: {len(dialogs)}{Theme.RESET}")
+            auths = await client(GetAuthorizationsRequest())
+            print(f"{Theme.INFO}📊 Active Sessions ({len(auths.authorizations)}):{Theme.RESET}")
+            for i, auth in enumerate(auths.authorizations, 1):
+                print(f"{Theme.INFO}{i}. Device: {auth.device_model} ({auth.platform})")
+                print(f"   IP: {auth.ip}")
+                print(f"   Location: {auth.country}")
+                print(f"   App: {auth.app_name} v{auth.app_version}")
+                print(f"   Last Active: {auth.date_active.strftime('%Y-%m-%d %H:%M:%S')}{Theme.RESET}")
         except Exception as e:
-            print(f"{Theme.ERROR}❌ Error checking sessions: {str(e)}{Theme.RESET}")
-
-async def reset_2fa():
-    """Reset 2FA with proper instructions"""
-    session = select_session()
-    if not session:
-        return
-    
-    async with TelegramClient(session, API_ID, API_HASH) as client:
-        await client.connect()
-        try:
-            await client.send_message("me", "2FA Reset Requested!")
-            print(f"{Theme.SUCCESS}✅ 2FA reset request sent.{Theme.RESET}")
-            print(f"{Theme.WARNING}ℹ️ Note: This will disable 2FA after a 7-day waiting period if not cancelled.")
-            print(f"Check your Telegram app under Settings > Privacy and Security to manage this request.{Theme.RESET}")
-        except Exception as e:
-            print(f"{Theme.ERROR}❌ Failed to request 2FA reset: {str(e)}{Theme.RESET}")
+            print(f"{Theme.ERROR}❌ Error fetching sessions: {str(e)}{Theme.RESET}")
 
 async def update_profile_random_name():
     """Update profile with random name"""
@@ -139,6 +133,90 @@ async def update_profile_random_name():
         except Exception as e:
             print(f"{Theme.ERROR}❌ Failed to update profile: {str(e)}{Theme.RESET}")
 
+async def clear_contacts():
+    """Clear all contacts"""
+    session = select_session()
+    if not session:
+        return
+    
+    async with TelegramClient(session, API_ID, API_HASH) as client:
+        await client.connect()
+        try:
+            contacts = await client.get_contacts()
+            if not contacts:
+                print(f"{Theme.WARNING}ℹ️ No contacts to clear.{Theme.RESET}")
+                return
+            await client(DeleteContactsRequest(id=[contact.id for contact in contacts]))
+            print(f"{Theme.SUCCESS}✅ Cleared {len(contacts)} contacts.{Theme.RESET}")
+        except Exception as e:
+            print(f"{Theme.ERROR}❌ Failed to clear contacts: {str(e)}{Theme.RESET}")
+
+async def delete_chat():
+    """Delete a selected chat"""
+    session = select_session()
+    if not session:
+        return
+    
+    async with TelegramClient(session, API_ID, API_HASH) as client:
+        await client.connect()
+        try:
+            dialogs = await client.get_dialogs()
+            if not dialogs:
+                print(f"{Theme.WARNING}ℹ️ No chats available.{Theme.RESET}")
+                return
+            
+            print(f"{Theme.INFO}\nAvailable Chats:{Theme.RESET}")
+            for i, dialog in enumerate(dialogs, 1):
+                print(f"{Theme.INFO}{i}. {dialog.title}{Theme.RESET}")
+            
+            choice = int(input(f"{Theme.PRIMARY}Select chat number to delete: {Theme.RESET}").strip()) - 1
+            if 0 <= choice < len(dialogs):
+                await client(DeleteChatRequest(chat_id=dialogs[choice].id))
+                print(f"{Theme.SUCCESS}✅ Chat '{dialogs[choice].title}' deleted.{Theme.RESET}")
+            else:
+                print(f"{Theme.ERROR}❌ Invalid chat selection.{Theme.RESET}")
+        except ValueError:
+            print(f"{Theme.ERROR}❌ Please enter a valid number.{Theme.RESET}")
+        except Exception as e:
+            print(f"{Theme.ERROR}❌ Failed to delete chat: {str(e)}{Theme.RESET}")
+
+async def check_spam_status():
+    """Check if account is spam-restricted"""
+    session = select_session()
+    if not session:
+        return
+    
+    async with TelegramClient(session, API_ID, API_HASH) as client:
+        await client.connect()
+        try:
+            ttl = await client(GetAccountTTLRequest())
+            print(f"{Theme.INFO}📋 Account Status:{Theme.RESET}")
+            print(f"{Theme.INFO}   Account TTL: {ttl.days} days")
+            # Simple spam check (this is limited as Telegram doesn't expose full spam status)
+            test_msg = await client.send_message("me", "Spam check test")
+            await client.delete_messages("me", [test_msg.id])
+            print(f"{Theme.SUCCESS}✅ Account appears unrestricted (can send messages).{Theme.RESET}")
+        except Exception as e:
+            print(f"{Theme.WARNING}⚠️ Possible spam restriction detected: {str(e)}{Theme.RESET}")
+
+async def read_session_otp():
+    """Read latest OTP from Telegram messages"""
+    session = select_session()
+    if not session:
+        return
+    
+    async with TelegramClient(session, API_ID, API_HASH) as client:
+        await client.connect()
+        try:
+            messages = await client.get_messages("me", limit=10)
+            for msg in messages:
+                if "code" in msg.text.lower() or "otp" in msg.text.lower():
+                    print(f"{Theme.SUCCESS}✅ Found OTP: {msg.text} (Received: {msg.date}){Theme.RESET}")
+                    return
+            print(f"{Theme.WARNING}ℹ️ No recent OTP found in last 10 messages.{Theme.RESET}")
+        except Exception as e:
+            print(f"{Theme.ERROR}❌ Failed to read OTP: {str(e)}{Theme.RESET}")
+
 async def safe_execute(func):
     """Execute function with exponential backoff for flood waits"""
     max_attempts = 3
@@ -154,29 +232,19 @@ async def safe_execute(func):
             break
     print(f"{Theme.ERROR}❌ Operation failed after {max_attempts} attempts.{Theme.RESET}")
 
-def cleanup_sessions():
-    """Remove old session files older than 30 days"""
-    sessions = list_sessions()
-    if not sessions:
-        return
-    
-    current_time = time.time()
-    for session in sessions:
-        file_time = os.path.getmtime(session)
-        if (current_time - file_time) > (30 * 24 * 3600):  # 30 days
-            os.remove(session)
-            print(f"{Theme.WARNING}🗑️ Removed old session: {session}{Theme.RESET}")
-
 async def main():
     """Main menu loop"""
     menu_options = {
         "1": ("Create New Session", create_session),
         "2": ("List Saved Sessions", list_sessions),
         "3": ("Terminate Other Sessions", terminate_other_sessions),
-        "4": ("Check Active Sessions", check_active_sessions),
-        "5": ("Reset 2FA", reset_2fa),
-        "6": ("Update Profile with Random Name", update_profile_random_name),
-        "7": ("Exit", None)
+        "4": ("Show Active Sessions", show_active_sessions),
+        "5": ("Update Profile with Random Name", update_profile_random_name),
+        "6": ("Clear Contacts", clear_contacts),
+        "7": ("Delete Chat", delete_chat),
+        "8": ("Check Spam Status", check_spam_status),
+        "9": ("Read Session OTP", read_session_otp),
+        "10": ("Exit", None)
     }
     
     while True:
@@ -187,9 +255,8 @@ async def main():
         choice = input(f"{Theme.PRIMARY}👉 Enter your choice: {Theme.RESET}").strip()
         
         if choice in menu_options:
-            if choice == "7":
+            if choice == "10":
                 print(f"{Theme.SUCCESS}👋 Exiting...{Theme.RESET}")
-                cleanup_sessions()
                 break
             elif choice == "2":
                 menu_options[choice][1]()
