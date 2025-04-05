@@ -3,9 +3,8 @@ import asyncio
 import getpass
 import random
 import glob
-import logging
 from telethon.sync import TelegramClient
-from telethon.errors import SessionPasswordNeededError, FloodWaitError, PhoneNumberInvalidError
+from telethon.errors import SessionPasswordNeededError, FloodWaitError
 from telethon.tl.functions.account import GetAuthorizationsRequest, ResetAuthorizationRequest
 from telethon.tl.functions.account import UpdateProfileRequest, GetAccountTTLRequest
 from telethon.tl.functions.contacts import DeleteContactsRequest
@@ -16,9 +15,8 @@ from colorama import Fore, Style, init
 import time
 from datetime import datetime
 
-# Initialize colorama and logging
+# Initialize colorama
 init(autoreset=True)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Custom Theme Configuration
 class Theme:
@@ -30,6 +28,8 @@ class Theme:
     MENU = Fore.MAGENTA
     RESET = Style.RESET_ALL
     TITLE = Style.BRIGHT + Fore.CYAN
+    BOLD = Style.BRIGHT
+    HIGHLIGHT = Style.BRIGHT + Fore.YELLOW
 
 # API credentials
 API_ID = int(os.getenv("TELEGRAM_API_ID", "23077946"))
@@ -42,81 +42,109 @@ if not os.path.exists(SESSION_FOLDER):
 
 def get_session_path(phone):
     """Generate session file path from phone number"""
-    return os.path.join(SESSION_FOLDER, f"session_{phone.replace('+', '')}")
+    return os.path.join(SESSION_FOLDER, f"{phone.replace('+', '')}.session")
+
+def print_header(title):
+    """Print formatted header"""
+    print(f"\n{Theme.TITLE}=== {title} ==={Theme.RESET}")
+
+def print_success(message):
+    """Print success message"""
+    print(f"{Theme.SUCCESS}✅ {message}{Theme.RESET}")
+
+def print_error(message):
+    """Print error message"""
+    print(f"{Theme.ERROR}❌ {message}{Theme.RESET}")
+
+def print_warning(message):
+    """Print warning message"""
+    print(f"{Theme.WARNING}⚠️ {message}{Theme.RESET}")
+
+def print_info(message):
+    """Print info message"""
+    print(f"{Theme.INFO}ℹ️ {message}{Theme.RESET}")
 
 async def login_session(session_path):
-    """Login to a session with error handling"""
+    """Login to a session with improved error handling"""
     try:
         client = TelegramClient(session_path, API_ID, API_HASH)
         await client.connect()
         
         if not await client.is_user_authorized():
-            print(f"{Theme.ERROR}❌ Session not authorized. Please create a new session.{Theme.RESET}")
+            print_error("Session not authorized. Please create a new session.")
             await client.disconnect()
             return None
             
-        print(f"{Theme.SUCCESS}✅ Successfully logged in using {os.path.basename(session_path)}{Theme.RESET}")
+        session_name = os.path.basename(session_path)
+        print_success(f"Logged in as {session_name}")
         return client
         
     except Exception as e:
-        logging.error(f"Login failed for {session_path}: {str(e)}")
-        print(f"{Theme.ERROR}❌ Login failed for {session_path}: {str(e)}{Theme.RESET}")
+        print_error(f"Login failed: {str(e)}")
         return None
 
 def list_sessions(country_code=None):
-    """List all saved session files from sessions folder only"""
-    sessions_pattern = os.path.join(SESSION_FOLDER, "session_*")
+    """List all saved session files with pretty formatting"""
+    sessions_pattern = os.path.join(SESSION_FOLDER, "*.session")
     sessions = glob.glob(sessions_pattern)
     
     if country_code:
         country_code = country_code.replace('+', '')
-        sessions = [s for s in sessions if os.path.basename(s).split('_')[1].startswith(country_code)]
+        sessions = [s for s in sessions if os.path.basename(s).startswith(country_code)]
     
     if not sessions:
-        print(f"{Theme.WARNING}ℹ️ No saved sessions found in {SESSION_FOLDER}{Theme.RESET}")
+        print_warning("No saved sessions found")
         return None
     
-    print(f"{Theme.INFO}\nAvailable Sessions:{Theme.RESET}")
+    print_header("Available Sessions")
     for i, session in enumerate(sessions, 1):
-        session_name = os.path.basename(session)
-        phone_part = session_name.split('_')[1]
-        print(f"{Theme.INFO}{i}. {phone_part}{Theme.RESET}")
+        session_name = os.path.basename(session).replace('.session', '')
+        print(f"{Theme.HIGHLIGHT}{i}. +{session_name}{Theme.RESET}")
     return sessions
 
-def select_session(country_code=None):
-    """Select a session from available ones"""
-    sessions = list_sessions(country_code)
+async def select_and_login():
+    """Select a session and login with retry logic"""
+    sessions = list_sessions()
     if not sessions:
         return None
     
     while True:
         try:
-            choice = input(f"{Theme.PRIMARY}\nSelect a session number (1-{len(sessions)}): {Theme.RESET}").strip()
+            choice = input(f"{Theme.PRIMARY}Select session (1-{len(sessions)}): {Theme.RESET}").strip()
             if not choice:
-                print(f"{Theme.ERROR}❌ Selection cannot be empty.{Theme.RESET}")
+                print_error("Selection cannot be empty")
                 continue
+                
             choice = int(choice) - 1
             if 0 <= choice < len(sessions):
-                return sessions[choice]
-            print(f"{Theme.ERROR}❌ Invalid selection. Choose between 1 and {len(sessions)}.{Theme.RESET}")
+                session_path = sessions[choice]
+                client = await login_session(session_path)
+                if client:
+                    return client
+                print_warning("Login failed, please try another session")
+                continue
+                
+            print_error(f"Invalid selection. Choose between 1 and {len(sessions)}")
         except ValueError:
-            print(f"{Theme.ERROR}❌ Please enter a valid number.{Theme.RESET}")
+            print_error("Please enter a valid number")
 
 async def create_session():
-    """Create a new Telegram session with duplicate prevention"""
+    """Create a new Telegram session with enhanced validation"""
+    print_header("Create New Session")
+    
     while True:
-        phone = input(f"{Theme.PRIMARY}📞 Enter phone number (e.g., +12345678900): {Theme.RESET}").strip()
+        phone = input(f"{Theme.PRIMARY}Enter phone number (e.g., +12345678900): {Theme.RESET}").strip()
         if not phone:
-            print(f"{Theme.ERROR}❌ Phone number cannot be empty.{Theme.RESET}")
+            print_error("Phone number cannot be empty")
             continue
         if not phone.startswith('+'):
-            print(f"{Theme.ERROR}❌ Invalid format. Must start with '+'.{Theme.RESET}")
+            print_error("Invalid format. Must start with '+'")
             continue
         break
     
     session_path = get_session_path(phone)
     if os.path.exists(session_path):
-        print(f"{Theme.WARNING}⚠️ Session already exists for {phone}.{Theme.RESET}")
+        print_warning(f"Session already exists for +{phone.replace('+', '')}")
         return session_path
     
     client = TelegramClient(session_path, API_ID, API_HASH)
@@ -124,35 +152,35 @@ async def create_session():
         await client.connect()
         
         if await client.is_user_authorized():
-            print(f"{Theme.SUCCESS}✅ Session already authorized: {session_path}{Theme.RESET}")
+            print_success(f"Session already authorized for +{phone.replace('+', '')}")
             return session_path
             
-        print(f"{Theme.INFO}ℹ️ Sending code to {phone}...{Theme.RESET}")
+        print_info(f"Sending code to +{phone.replace('+', '')}...")
         await client.send_code_request(phone)
         
         while True:
-            code = input(f"{Theme.WARNING}🔑 Enter code (or 'q' to quit): {Theme.RESET}").strip()
+            code = input(f"{Theme.WARNING}Enter code (or 'q' to quit): {Theme.RESET}").strip()
             if code.lower() == 'q':
                 await client.disconnect()
-                os.remove(session_path)  # Clean up if cancelled
+                os.remove(session_path)
                 return None
                 
             try:
                 await client.sign_in(phone, code)
                 break
             except SessionPasswordNeededError:
-                password = getpass.getpass(f"{Theme.ERROR}🔒 Enter 2FA password: {Theme.RESET}")
+                password = getpass.getpass(f"{Theme.ERROR}Enter 2FA password: {Theme.RESET}")
                 await client.sign_in(password=password)
                 break
             except Exception as e:
-                print(f"{Theme.ERROR}❌ Error: {str(e)}{Theme.RESET}")
+                print_error(f"Invalid code: {str(e)}")
                 continue
                 
-        print(f"{Theme.SUCCESS}✅ Session created: {os.path.basename(session_path)}{Theme.RESET}")
+        print_success(f"Session created for +{phone.replace('+', '')}")
         return session_path
         
     except Exception as e:
-        print(f"{Theme.ERROR}❌ Error creating session: {str(e)}{Theme.RESET}")
+        print_error(f"Failed to create session: {str(e)}")
         if os.path.exists(session_path):
             os.remove(session_path)
         return None
@@ -160,183 +188,202 @@ async def create_session():
         await client.disconnect()
 
 async def terminate_other_sessions():
-    """Terminate all sessions except current one"""
-    session = select_session()
-    if not session:
-        return
-    
-    client = await login_session(session)
+    """Terminate all sessions except current one with confirmation"""
+    print_header("Terminate Other Sessions")
+    client = await select_and_login()
     if not client:
         return
     
     try:
         auths = await client(GetAuthorizationsRequest())
         if not auths.authorizations:
-            print(f"{Theme.WARNING}ℹ️ No other active sessions found.{Theme.RESET}")
+            print_info("No other active sessions found")
             return
             
-        confirm = input(f"{Theme.WARNING}⚠️ This will terminate {len(auths.authorizations)} other sessions. Continue? (y/n): {Theme.RESET}").strip().lower()
+        current_session = next((a for a in auths.authorizations if a.current), None)
+        other_sessions = [a for a in auths.authorizations if not a.current]
+        
+        print_header("Active Sessions")
+        print(f"{Theme.INFO}Current session:")
+        print(f"  Device: {current_session.device_model}")
+        print(f"  IP: {current_session.ip}")
+        print(f"  Last active: {current_session.date_active.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        print(f"\n{Theme.WARNING}Other sessions to terminate ({len(other_sessions)}):")
+        for i, auth in enumerate(other_sessions, 1):
+            print(f"  {i}. Device: {auth.device_model} ({auth.ip})")
+        
+        confirm = input(f"\n{Theme.WARNING}Confirm termination? (y/n): {Theme.RESET}").strip().lower()
         if confirm != 'y':
-            print(f"{Theme.INFO}ℹ️ Operation cancelled.{Theme.RESET}")
+            print_info("Operation cancelled")
             return
             
-        await client(ResetAuthorizationRequest())
-        print(f"{Theme.SUCCESS}✅ All other sessions terminated.{Theme.RESET}")
+        for auth in other_sessions:
+            try:
+                await client(ResetAuthorizationRequest(hash=auth.hash))
+                print_success(f"Terminated session from {auth.device_model}")
+            except Exception as e:
+                print_error(f"Failed to terminate session: {str(e)}")
+                
+        print_success("All other sessions terminated")
     except Exception as e:
-        print(f"{Theme.ERROR}❌ Failed to terminate sessions: {str(e)}{Theme.RESET}")
+        print_error(f"Failed to terminate sessions: {str(e)}")
     finally:
         await client.disconnect()
 
 async def show_active_sessions():
     """Show detailed info about active sessions"""
-    session = select_session()
-    if not session:
-        return
-    
-    client = await login_session(session)
+    print_header("Active Sessions")
+    client = await select_and_login()
     if not client:
         return
     
     try:
         auths = await client(GetAuthorizationsRequest())
         if not auths.authorizations:
-            print(f"{Theme.WARNING}ℹ️ No active sessions found.{Theme.RESET}")
+            print_info("No active sessions found")
             return
             
-        print(f"{Theme.INFO}📊 Active Sessions ({len(auths.authorizations)}):{Theme.RESET}")
+        print(f"{Theme.INFO}Active Sessions ({len(auths.authorizations)}):")
         for i, auth in enumerate(auths.authorizations, 1):
-            print(f"{Theme.INFO}{i}. Device: {auth.device_model} ({auth.platform})")
-            print(f"   IP: {auth.ip}")
-            print(f"   Location: {auth.country}")
+            status = "CURRENT" if auth.current else "Other"
+            color = Theme.SUCCESS if auth.current else Theme.INFO
+            print(f"{color}{i}. {status} session:")
+            print(f"   Device: {auth.device_model} ({auth.platform})")
+            print(f"   IP: {auth.ip} ({auth.country})")
             print(f"   App: {auth.app_name} v{auth.app_version}")
-            print(f"   Last Active: {auth.date_active.strftime('%Y-%m-%d %H:%M:%S')}{Theme.RESET}")
+            print(f"   Last Active: {auth.date_active.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"   Created: {auth.date_created.strftime('%Y-%m-%d %H:%M:%S')}{Theme.RESET}")
     except Exception as e:
-        print(f"{Theme.ERROR}❌ Error fetching sessions: {str(e)}{Theme.RESET}")
+        print_error(f"Error fetching sessions: {str(e)}")
     finally:
         await client.disconnect()
 
 async def update_profile_random_name():
     """Update profile with random name"""
-    session = select_session()
-    if not session:
-        return
-    
-    client = await login_session(session)
+    print_header("Update Profile")
+    client = await select_and_login()
     if not client:
         return
     
     try:
-        new_name = f"User_{int(time.time())}"
+        me = await client.get_me()
+        old_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
+        
+        new_name = f"User_{random.randint(1000, 9999)}"
         await client(UpdateProfileRequest(first_name=new_name))
-        print(f"{Theme.SUCCESS}✅ Profile updated to: {new_name}{Theme.RESET}")
+        print_success(f"Profile updated from '{old_name}' to '{new_name}'")
     except Exception as e:
-        print(f"{Theme.ERROR}❌ Failed to update profile: {str(e)}{Theme.RESET}")
+        print_error(f"Failed to update profile: {str(e)}")
     finally:
         await client.disconnect()
 
 async def clear_contacts():
-    """Clear all contacts"""
-    session = select_session()
-    if not session:
-        return
-    
-    client = await login_session(session)
+    """Clear all contacts with confirmation"""
+    print_header("Clear Contacts")
+    client = await select_and_login()
     if not client:
         return
     
     try:
-        contacts = [contact async for contact in client.iter_contacts()]
+        contacts = await client.get_contacts()
         if not contacts:
-            print(f"{Theme.WARNING}ℹ️ No contacts to clear.{Theme.RESET}")
+            print_info("No contacts to clear")
             return
             
-        confirm = input(f"{Theme.WARNING}⚠️ This will delete {len(contacts)} contacts. Continue? (y/n): {Theme.RESET}").strip().lower()
+        print(f"{Theme.WARNING}Found {len(contacts)} contacts:")
+        for i, contact in enumerate(contacts[:5], 1):
+            print(f"  {i}. {contact.first_name} {contact.last_name or ''} ({contact.phone or 'no phone'})")
+        if len(contacts) > 5:
+            print(f"  ...and {len(contacts)-5} more")
+            
+        confirm = input(f"\n{Theme.WARNING}Delete ALL contacts? (y/n): {Theme.RESET}").strip().lower()
         if confirm != 'y':
-            print(f"{Theme.INFO}ℹ️ Operation cancelled.{Theme.RESET}")
+            print_info("Operation cancelled")
             return
             
         await client(DeleteContactsRequest(id=[contact.id for contact in contacts]))
-        print(f"{Theme.SUCCESS}✅ Cleared {len(contacts)} contacts.{Theme.RESET}")
+        print_success(f"Deleted {len(contacts)} contacts")
     except Exception as e:
-        print(f"{Theme.ERROR}❌ Failed to clear contacts: {str(e)}{Theme.RESET}")
+        print_error(f"Failed to clear contacts: {str(e)}")
     finally:
         await client.disconnect()
 
 async def delete_all_chats():
-    """Delete all chats, groups, and channels"""
-    session = select_session()
-    if not session:
-        return
-    
-    client = await login_session(session)
+    """Delete all chats, groups, and channels with confirmation"""
+    print_header("Delete All Chats")
+    client = await select_and_login()
     if not client:
         return
     
     try:
-        dialogs = await client.get_dialogs()
+        dialogs = await client.get_dialogs(limit=None)
         if not dialogs:
-            print(f"{Theme.WARNING}ℹ️ No chats/channels found.{Theme.RESET}")
+            print_info("No chats/channels found")
             return
             
-        confirm = input(f"{Theme.WARNING}⚠️ This will delete {len(dialogs)} chats/channels. Continue? (y/n): {Theme.RESET}").strip().lower()
+        # Filter out saved messages and other special chats
+        dialogs = [d for d in dialogs if d.id not in (777000, 429000)]
+        
+        print(f"{Theme.WARNING}Found {len(dialogs)} chats/channels:")
+        for i, dialog in enumerate(dialogs[:5], 1):
+            print(f"  {i}. {dialog.name} ({'group' if dialog.is_group else 'channel' if dialog.is_channel else 'chat'})")
+        if len(dialogs) > 5:
+            print(f"  ...and {len(dialogs)-5} more")
+            
+        confirm = input(f"\n{Theme.WARNING}Delete ALL chats/channels? (y/n): {Theme.RESET}").strip().lower()
         if confirm != 'y':
-            print(f"{Theme.INFO}ℹ️ Operation cancelled.{Theme.RESET}")
+            print_info("Operation cancelled")
             return
             
-        total_cleared = 0
+        deleted_count = 0
         for dialog in dialogs:
             try:
-                if isinstance(dialog.entity, PeerChat):
-                    await client(DeleteHistoryRequest(peer=dialog.entity, max_id=0, just_clear=True))
-                    print(f"{Theme.SUCCESS}✅ Cleared chat: {dialog.title}{Theme.RESET}")
-                elif isinstance(dialog.entity, PeerChannel):
-                    await client(LeaveChannelRequest(channel=dialog.entity))
-                    print(f"{Theme.SUCCESS}✅ Left channel: {dialog.title}{Theme.RESET}")
-                total_cleared += 1
+                if dialog.is_channel:
+                    await client(LeaveChannelRequest(dialog.entity))
+                    print_success(f"Left channel: {dialog.name}")
+                else:
+                    await client.delete_dialog(dialog)
+                    print_success(f"Deleted chat: {dialog.name}")
+                deleted_count += 1
                 await asyncio.sleep(1)  # Rate limiting
             except Exception as e:
-                print(f"{Theme.WARNING}⚠️ Skipped {dialog.title}: {str(e)}{Theme.RESET}")
+                print_warning(f"Failed to delete {dialog.name}: {str(e)}")
                 
-        print(f"{Theme.SUCCESS}✅ Total {total_cleared} chats/channels wiped.{Theme.RESET}")
+        print_success(f"Deleted {deleted_count} chats/channels")
     except Exception as e:
-        print(f"{Theme.ERROR}❌ Error: {str(e)}{Theme.RESET}")
+        print_error(f"Error: {str(e)}")
     finally:
         await client.disconnect()
 
 async def check_spam_status():
     """Check if account is spam-restricted"""
-    session = select_session()
-    if not session:
-        return
-    
-    client = await login_session(session)
+    print_header("Check Spam Status")
+    client = await select_and_login()
     if not client:
         return
     
     try:
         ttl = await client(GetAccountTTLRequest())
-        print(f"{Theme.INFO}📋 Account Status:{Theme.RESET}")
-        print(f"{Theme.INFO}   Account TTL: {ttl.days} days")
+        print(f"{Theme.INFO}Account Status:")
+        print(f"  TTL: {ttl.days} days until deletion if inactive")
         
         try:
-            test_msg = await client.send_message("me", f"Spam check {datetime.now()}")
+            test_msg = await client.send_message("me", "Spam check message")
             await client.delete_messages("me", [test_msg.id])
-            print(f"{Theme.SUCCESS}✅ Account appears unrestricted.{Theme.RESET}")
+            print_success("Account appears unrestricted")
         except Exception as e:
-            print(f"{Theme.WARNING}⚠️ Possible spam restriction: {str(e)}{Theme.RESET}")
+            print_warning(f"Possible restriction: {str(e)}")
             
     except Exception as e:
-        print(f"{Theme.ERROR}❌ Error checking status: {str(e)}{Theme.RESET}")
+        print_error(f"Error checking status: {str(e)}")
     finally:
         await client.disconnect()
 
 async def read_session_otp():
     """Read latest OTP from Telegram messages"""
-    session = select_session()
-    if not session:
-        return
-    
-    client = await login_session(session)
+    print_header("Read OTP")
+    client = await select_and_login()
     if not client:
         return
     
@@ -345,19 +392,22 @@ async def read_session_otp():
         for msg in messages:
             if "login code" in msg.text.lower():
                 code = ''.join(filter(str.isdigit, msg.text))
-                print(f"{Theme.SUCCESS}✅ OTP: {code} (Received: {msg.date}){Theme.RESET}")
+                print_success(f"OTP found: {code}")
+                print(f"  Message: {msg.text.split('\n')[0]}")
+                print(f"  Received: {msg.date.strftime('%Y-%m-%d %H:%M:%S')}")
                 return
-        print(f"{Theme.WARNING}ℹ️ No recent OTP found.{Theme.RESET}")
+        print_info("No recent OTP messages found")
     except Exception as e:
-        print(f"{Theme.ERROR}❌ Failed to read OTP: {str(e)}{Theme.RESET}")
+        print_error(f"Failed to read OTP: {str(e)}")
     finally:
         await client.disconnect()
 
 async def get_random_session_by_country():
     """Get random session by country code"""
+    print_header("Random Session by Country")
     country_code = input(f"{Theme.PRIMARY}Enter country code (e.g., +91): {Theme.RESET}").strip()
     if not country_code.startswith('+'):
-        print(f"{Theme.ERROR}❌ Country code must start with '+'.{Theme.RESET}")
+        print_error("Country code must start with '+'")
         return None
     
     sessions = list_sessions(country_code)
@@ -365,7 +415,7 @@ async def get_random_session_by_country():
         return None
         
     session = random.choice(sessions)
-    print(f"{Theme.SUCCESS}✅ Selected: {os.path.basename(session)}{Theme.RESET}")
+    print_success(f"Selected: +{os.path.basename(session).replace('.session', '')}")
     return session
 
 async def safe_execute(func):
@@ -375,15 +425,14 @@ async def safe_execute(func):
         try:
             return await func()
         except FloodWaitError as e:
-            wait_time = min(e.seconds * (2 ** attempt), 3600)
-            print(f"{Theme.WARNING}⏳ Flood wait: Waiting {wait_time}s (Attempt {attempt + 1}/{max_attempts})...{Theme.RESET}")
+            wait_time = min(e.seconds, 3600)  # Max 1 hour wait
+            print_warning(f"Flood wait: {wait_time} seconds (Attempt {attempt + 1}/{max_attempts})")
             await asyncio.sleep(wait_time)
         except Exception as e:
-            print(f"{Theme.ERROR}❌ Error: {str(e)}{Theme.RESET}")
+            print_error(f"Attempt {attempt + 1} failed: {str(e)}")
             if attempt == max_attempts - 1:
-                print(f"{Theme.ERROR}❌ Failed after {max_attempts} attempts.{Theme.RESET}")
                 return None
-            await asyncio.sleep(2 ** attempt)
+            await asyncio.sleep(1)
 
 async def main():
     """Main menu loop"""
@@ -392,37 +441,37 @@ async def main():
         "2": ("List Saved Sessions", lambda: list_sessions()),
         "3": ("Terminate Other Sessions", terminate_other_sessions),
         "4": ("Show Active Sessions", show_active_sessions),
-        "5": ("Update Profile with Random Name", update_profile_random_name),
+        "5": ("Update Profile", update_profile_random_name),
         "6": ("Clear Contacts", clear_contacts),
-        "7": ("Delete All Chats/Channels", delete_all_chats),
+        "7": ("Delete All Chats", delete_all_chats),
         "8": ("Check Spam Status", check_spam_status),
-        "9": ("Read Session OTP", read_session_otp),
-        "10": ("Get Random Session by Country", get_random_session_by_country),
+        "9": ("Read OTP", read_session_otp),
+        "10": ("Random Session by Country", get_random_session_by_country),
         "11": ("Exit", None)
     }
     
     while True:
-        print(f"{Theme.TITLE}\n=== Telegram Session Manager ==={Theme.RESET}")
+        print_header("Telegram Session Manager")
         for key, (desc, _) in menu_options.items():
             print(f"{Theme.MENU}{key}. {desc}{Theme.RESET}")
         
-        choice = input(f"{Theme.PRIMARY}👉 Enter your choice (1-{len(menu_options)}): {Theme.RESET}").strip()
+        choice = input(f"\n{Theme.PRIMARY}Select option (1-11): {Theme.RESET}").strip()
         
         if choice in menu_options:
             if choice == "11":
-                print(f"{Theme.SUCCESS}👋 Exiting...{Theme.RESET}")
+                print_success("Goodbye!")
                 break
             elif choice == "2":
                 menu_options[choice][1]()
             else:
                 await safe_execute(menu_options[choice][1])
         else:
-            print(f"{Theme.ERROR}❌ Invalid choice! Select 1-{len(menu_options)}{Theme.RESET}")
+            print_error(f"Invalid choice! Please select 1-11")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print(f"\n{Theme.ERROR}❌ Operation cancelled by user.{Theme.RESET}")
+        print_error("\nOperation cancelled by user")
     except Exception as e:
-        print(f"{Theme.ERROR}❌ Fatal error: {str(e)}{Theme.RESET}")
+        print_error(f"Fatal error: {str(e)}")
