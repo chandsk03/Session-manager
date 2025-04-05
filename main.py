@@ -41,6 +41,51 @@ def get_session_path(phone):
     """Generate session file path from phone number"""
     return os.path.join(SESSION_FOLDER, f"session_{phone.replace('+', '')}.session")
 
+def list_sessions(country_code=None):
+    """List all saved session files from both root and sessions folder"""
+    # Check both root directory and sessions folder
+    root_pattern = "session_*.session"
+    sessions_pattern = os.path.join(SESSION_FOLDER, "session_*.session")
+    
+    # Get sessions from both locations
+    root_sessions = glob.glob(root_pattern)
+    folder_sessions = glob.glob(sessions_pattern)
+    
+    # Combine and remove duplicates
+    sessions = list(set(root_sessions + folder_sessions))
+    
+    if country_code:
+        sessions = [s for s in sessions if os.path.basename(s).replace('.session', '').split('_')[1].startswith(country_code.replace('+', ''))]
+    
+    if not sessions:
+        print(f"{Theme.WARNING}ℹ️ No saved sessions found.{Theme.RESET}")
+        return None
+    
+    print(f"{Theme.INFO}\nAvailable Sessions:{Theme.RESET}")
+    for i, session in enumerate(sessions, 1):
+        # Show relative path to make it clear where the session is located
+        print(f"{Theme.INFO}{i}. {session.replace('.session', '')}{Theme.RESET}")
+    return sessions
+
+def select_session(country_code=None):
+    """Select a session from available ones with optional country code filter"""
+    sessions = list_sessions(country_code)
+    if not sessions:
+        return None
+    
+    while True:
+        try:
+            choice = input(f"{Theme.PRIMARY}\nSelect a session number (1-{len(sessions)}): {Theme.RESET}").strip()
+            if not choice:
+                print(f"{Theme.ERROR}❌ Selection cannot be empty.{Theme.RESET}")
+                continue
+            choice = int(choice) - 1
+            if 0 <= choice < len(sessions):
+                return sessions[choice]
+            print(f"{Theme.ERROR}❌ Invalid selection. Choose between 1 and {len(sessions)}.{Theme.RESET}")
+        except ValueError:
+            print(f"{Theme.ERROR}❌ Please enter a valid number.{Theme.RESET}")
+
 async def create_session():
     """Create a new Telegram session with improved handling"""
     while True:
@@ -89,41 +134,6 @@ async def create_session():
                 return None
         print(f"{Theme.ERROR}❌ Failed after 3 attempts. Check network/API credentials.{Theme.RESET}")
         return None
-
-def list_sessions(country_code=None):
-    """List all saved session files, optionally filtered by country code"""
-    pattern = os.path.join(SESSION_FOLDER, "session_*.session")
-    sessions = glob.glob(pattern)
-    if country_code:
-        sessions = [s for s in sessions if s.replace('.session', '').split('_')[1].startswith(country_code.replace('+', ''))]
-    
-    if not sessions:
-        print(f"{Theme.WARNING}ℹ️ No saved sessions found.{Theme.RESET}")
-        return None
-    
-    print(f"{Theme.INFO}\nAvailable Sessions:{Theme.RESET}")
-    for i, session in enumerate(sessions, 1):
-        print(f"{Theme.INFO}{i}. {os.path.basename(session).replace('.session', '')}{Theme.RESET}")
-    return sessions
-
-def select_session(country_code=None):
-    """Select a session from available ones with optional country code filter"""
-    sessions = list_sessions(country_code)
-    if not sessions:
-        return None
-    
-    while True:
-        try:
-            choice = input(f"{Theme.PRIMARY}\nSelect a session number (1-{len(sessions)}): {Theme.RESET}").strip()
-            if not choice:
-                print(f"{Theme.ERROR}❌ Selection cannot be empty.{Theme.RESET}")
-                continue
-            choice = int(choice) - 1
-            if 0 <= choice < len(sessions):
-                return sessions[choice]
-            print(f"{Theme.ERROR}❌ Invalid selection. Choose between 1 and {len(sessions)}.{Theme.RESET}")
-        except ValueError:
-            print(f"{Theme.ERROR}❌ Please enter a valid number.{Theme.RESET}")
 
 async def terminate_other_sessions():
     """Terminate all sessions except current one"""
