@@ -27,16 +27,25 @@ from colorama import Fore, Style, init
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    BarColumn,
+    TimeRemainingColumn
+)
 from rich.tree import Tree
-from rich import box
+from rich.layout import Layout
+from rich.live import Live
 from rich.text import Text
+from rich import box
 import time
 from datetime import datetime
 import platform
-from typing import List, Optional, Dict, Any, Tuple
-import socket
-import hashlib
+from typing import List, Optional, Dict, Any
+import signal
+import sys
+import sqlite3
 
 # Initialize colorama and rich console
 init(autoreset=True)
@@ -67,17 +76,35 @@ if not os.path.exists(SESSION_FOLDER):
 DEVICE_INFO = {
     "device_model": "Telegram Session Manager Pro",
     "system_version": platform.platform(),
-    "app_version": "3.0",
+    "app_version": "4.0",
     "lang_code": "en",
     "system_lang_code": "en-US"
 }
 
 # Rate limiting configuration
 RATE_LIMIT = {
-    "contacts": 1.2,  # seconds between operations
+    "contacts": 1.2,
     "chats": 1.5,
     "messages": 0.8
 }
+
+# Global flag for live display
+live_display = None
+
+def cleanup():
+    """Cleanup resources before exit"""
+    global live_display
+    if live_display:
+        live_display.stop()
+    console.print("\n[bold red]Cleaning up resources...[/bold red]")
+    sys.exit(0)
+
+def signal_handler(sig, frame):
+    """Handle interrupt signals"""
+    cleanup()
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 def get_session_path(phone: str) -> str:
     """Generate session file path from phone number"""
@@ -86,7 +113,12 @@ def get_session_path(phone: str) -> str:
 
 def print_header(title: str) -> None:
     """Print formatted header with rich"""
-    console.print(Panel.fit(title, style="bold cyan", border_style="blue"))
+    console.print(Panel.fit(
+        title,
+        style="bold cyan",
+        border_style="blue",
+        subtitle="Telegram Session Manager v4.0"
+    ))
 
 def print_success(message: str) -> None:
     """Print success message"""
@@ -112,7 +144,7 @@ def validate_phone(phone: str) -> bool:
     return digits.isdigit() and len(digits) >= 8
 
 async def login_session(session_path: str) -> Optional[TelegramClient]:
-    """Advanced session login with error handling and device spoofing"""
+    """Advanced session login with error handling"""
     try:
         client = TelegramClient(
             session_path,
@@ -125,7 +157,9 @@ async def login_session(session_path: str) -> Optional[TelegramClient]:
             system_lang_code=DEVICE_INFO["system_lang_code"],
             request_retries=5,
             connection_retries=5,
-            auto_reconnect=True
+            auto_reconnect=True,
+            connection_timeout=30,
+            retry_delay=5
         )
         
         await client.connect()
@@ -135,7 +169,6 @@ async def login_session(session_path: str) -> Optional[TelegramClient]:
             await client.disconnect()
             return None
             
-        session_name = os.path.basename(session_path)
         me = await client.get_me()
         print_success(f"Logged in as [bold]{me.first_name or 'Unknown'}[/bold] (ID: {me.id})")
         return client
@@ -219,73 +252,86 @@ async def create_session() -> Optional[str]:
         await client.disconnect()
     return None
 
-def list_sessions(country_code: Optional[str] = None) -> Optional[List[str]]:
+async def list_sessions(country_code: Optional[str] = None) -> Optional[List[str]]:
     """List all saved session files with rich table"""
-    sessions_pattern = os.path.join(SESSION_FOLDER, "*.session")
-    sessions = glob.glob(sessions_pattern)
-    
-    if country_code:
-        country_code = country_code.replace('+', '')
-        sessions = [s for s in sessions if os.path.basename(s).startswith(country_code)]
-    
-    if not sessions:
-        print_warning("No saved sessions found")
-        return None
-    
-    table = Table(title="Available Sessions", box=box.ROUNDED)
-    table.add_column("#", style="cyan", justify="right")
-    table.add_column("Phone Number", style="magenta")
-    table.add_column("Session File", style="yellow")
-    table.add_column("Size", style="green")
-    table.add_column("Last Modified", style="blue")
-    
-    for i, session in enumerate(sessions, 1):
-        session_name = os.path.basename(session).replace('.session', '')
-        size = os.path.getsize(session) / 1024  # KB
-        mtime = datetime.fromtimestamp(os.path.getmtime(session))
-        table.add_row(
-            str(i),
-            f"+{session_name}",
-            os.path.basename(session),
-            f"{size:.2f} KB",
-            mtime.strftime('%Y-%m-%d %H:%M')
+    try:
+        sessions_pattern = os.path.join(SESSION_FOLDER, "*.session")
+        sessions = glob.glob(sessions_pattern)
+        
+        if country_code:
+            country_code = country_code.replace('+', '')
+            sessions = [s for s in sessions if os.path.basename(s).startswith(country_code)]
+        
+        if not sessions:
+            print_warning("No saved sessions found")
+            return None
+        
+        table = Table(
+            title="Available Sessions",
+            box=box.ROUNDED,
+            header_style="bold magenta",
+            row_styles=["dim", ""]
         )
-    
-    console.print(table)
-    return sessions
+        table.add_column("#", style="cyan", justify="right")
+        table.add_column("Phone Number", style="magenta")
+        table.add_column("Session File", style="yellow")
+        table.add_column("Size", style="green")
+        table.add_column("Last Modified", style="blue")
+        
+        for i, session in enumerate(sorted(sessions, key=os.path.getmtime, reverse=True), 1):
+            session_name = os.path.basename(session).replace('.session', '')
+            size = os.path.getsize(session) / 1024  # KB
+            mtime = datetime.fromtimestamp(os.path.getmtime(session))
+            table.add_row(
+                str(i),
+                f"+{session_name}",
+                os.path.basename(session),
+                f"{size:.2f} KB",
+                mtime.strftime('%Y-%m-%d %H:%M')
+            )
+        
+        console.print(table)
+        return sessions
+    except Exception as e:
+        print_error(f"Error listing sessions: {str(e)}")
+        return None
 
 async def select_and_login() -> Optional[TelegramClient]:
     """Select a session and login with retry logic"""
-    sessions = list_sessions()
-    if not sessions:
+    try:
+        sessions = await list_sessions()
+        if not sessions:
+            return None
+        
+        while True:
+            try:
+                choice = console.input(
+                    f"[bold cyan]Select session (1-{len(sessions)}): [/bold cyan]"
+                ).strip()
+                
+                if not choice:
+                    print_error("Selection cannot be empty")
+                    continue
+                    
+                choice = int(choice) - 1
+                if 0 <= choice < len(sessions):
+                    session_path = sessions[choice]
+                    
+                    with console.status("[bold blue]Connecting...[/bold blue]", spinner="dots"):
+                        client = await login_session(session_path)
+                    
+                    if client:
+                        return client
+                    
+                    print_warning("Login failed, please try another session")
+                    continue
+                    
+                print_error(f"Invalid selection. Choose between 1 and {len(sessions)}")
+            except ValueError:
+                print_error("Please enter a valid number")
+    except Exception as e:
+        print_error(f"Error selecting session: {str(e)}")
         return None
-    
-    while True:
-        try:
-            choice = console.input(
-                f"[bold cyan]Select session (1-{len(sessions)}): [/bold cyan]"
-            ).strip()
-            
-            if not choice:
-                print_error("Selection cannot be empty")
-                continue
-                
-            choice = int(choice) - 1
-            if 0 <= choice < len(sessions):
-                session_path = sessions[choice]
-                
-                with console.status("[bold blue]Connecting...[/bold blue]", spinner="dots"):
-                    client = await login_session(session_path)
-                
-                if client:
-                    return client
-                
-                print_warning("Login failed, please try another session")
-                continue
-                
-            print_error(f"Invalid selection. Choose between 1 and {len(sessions)}")
-        except ValueError:
-            print_error("Please enter a valid number")
 
 async def terminate_other_sessions() -> None:
     """Terminate all sessions except current one with confirmation"""
@@ -306,23 +352,60 @@ async def terminate_other_sessions() -> None:
         other_sessions = [a for a in auths.authorizations if not a.current]
         
         # Display session info
-        tree = Tree("[bold cyan]Active Sessions[/bold cyan]")
+        layout = Layout()
+        layout.split_column(
+            Layout(name="header"),
+            Layout(name="body", ratio=2),
+            Layout(name="footer")
+        )
         
-        current_branch = tree.add(f"[green]Current Session[/green]")
-        current_branch.add(f"Device: {current_session.device_model}")
-        current_branch.add(f"IP: {current_session.ip}")
-        current_branch.add(f"Location: {current_session.country}")
-        current_branch.add(f"Created: {current_session.date_created.strftime('%Y-%m-%d %H:%M:%S')}")
+        layout["header"].update(
+            Panel("[bold cyan]Active Sessions[/bold cyan]", border_style="blue")
+        )
         
-        other_branch = tree.add(f"[red]Other Sessions ({len(other_sessions)})[/red]")
-        for auth in other_sessions[:3]:  # Show first 3 for brevity
-            other_branch.add(
-                f"{auth.device_model} ({auth.ip}) - Last active: {auth.date_active.strftime('%Y-%m-%d %H:%M:%S')}"
+        current_table = Table(box=box.SIMPLE, show_header=False)
+        current_table.add_column(style="green")
+        current_table.add_row(f"[bold]Current Session[/bold]")
+        current_table.add_row(f"Device: {current_session.device_model}")
+        current_table.add_row(f"IP: {current_session.ip}")
+        current_table.add_row(f"Location: {current_session.country}")
+        current_table.add_row(f"Created: {current_session.date_created.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        other_table = Table(
+            title=f"Other Sessions ({len(other_sessions)})",
+            box=box.ROUNDED,
+            header_style="bold red"
+        )
+        other_table.add_column("Device", style="cyan")
+        other_table.add_column("IP", style="magenta")
+        other_table.add_column("Last Active", style="yellow")
+        
+        for auth in other_sessions[:10]:
+            other_table.add_row(
+                auth.device_model,
+                auth.ip,
+                auth.date_active.strftime('%Y-%m-%d %H:%M:%S')
             )
-        if len(other_sessions) > 3:
-            other_branch.add(f"...and {len(other_sessions)-3} more")
         
-        console.print(tree)
+        if len(other_sessions) > 10:
+            other_table.add_row("...", f"...and {len(other_sessions)-10} more", "...")
+        
+        layout["body"].update(
+            Panel(
+                current_table,
+                title="Current Session",
+                border_style="green"
+            )
+        )
+        layout["footer"].update(
+            Panel(
+                other_table,
+                title="Other Active Sessions",
+                border_style="red"
+            )
+        )
+        
+        console.print(layout)
         
         confirm = console.input("[bold red]Confirm termination of ALL other sessions? (y/n): [/bold red]").strip().lower()
         if confirm != 'y':
@@ -332,14 +415,17 @@ async def terminate_other_sessions() -> None:
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TimeRemainingColumn(),
             transient=True
         ) as progress:
-            task = progress.add_task("Terminating sessions...", total=len(other_sessions))
+            task = progress.add_task("[red]Terminating sessions...[/red]", total=len(other_sessions))
             
             for auth in other_sessions:
                 try:
                     await client(ResetAuthorizationRequest(hash=auth.hash))
                     progress.update(task, advance=1)
+                    await asyncio.sleep(0.5)
                 except Exception as e:
                     print_warning(f"Failed to terminate session {auth.hash}: {str(e)}")
         
@@ -364,7 +450,12 @@ async def show_active_sessions() -> None:
             print_info("No active sessions found")
             return
             
-        table = Table(title=f"Active Sessions ({len(auths.authorizations)})", box=box.ROUNDED)
+        table = Table(
+            title=f"Active Sessions ({len(auths.authorizations)})",
+            box=box.ROUNDED,
+            header_style="bold cyan",
+            row_styles=["dim", ""]
+        )
         table.add_column("Status", style="bold")
         table.add_column("Device", style="cyan")
         table.add_column("IP/Location", style="magenta")
@@ -375,8 +466,8 @@ async def show_active_sessions() -> None:
             status = "[green]Current[/green]" if auth.current else "[red]Other[/red]"
             table.add_row(
                 status,
-                f"{auth.device_model}\n{auth.platform}",
-                f"{auth.ip}\n{auth.country}",
+                f"{auth.device_model}\n[dim]{auth.platform}[/dim]",
+                f"{auth.ip}\n[dim]{auth.country}[/dim]",
                 auth.date_active.strftime('%Y-%m-%d %H:%M:%S'),
                 auth.date_created.strftime('%Y-%m-%d %H:%M:%S')
             )
@@ -436,7 +527,12 @@ async def clear_contacts() -> None:
             return
             
         # Display contacts in a table
-        table = Table(title=f"Found {len(contact_list)} Contacts", box=box.ROUNDED)
+        table = Table(
+            title=f"Found {len(contact_list)} Contacts",
+            box=box.ROUNDED,
+            header_style="bold magenta",
+            row_styles=["dim", ""]
+        )
         table.add_column("ID", style="cyan")
         table.add_column("Name", style="magenta")
         table.add_column("Phone", style="green")
@@ -461,6 +557,8 @@ async def clear_contacts() -> None:
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TimeRemainingColumn(),
             transient=True
         ) as progress:
             task = progress.add_task("[red]Deleting contacts...[/red]", total=len(contact_list))
@@ -471,7 +569,7 @@ async def clear_contacts() -> None:
                 batch = contact_list[i:i+batch_size]
                 await client(DeleteContactsRequest(id=[c.user_id for c in batch]))
                 progress.update(task, advance=len(batch))
-                await asyncio.sleep(RATE_LIMIT["contacts"])  # Rate limiting
+                await asyncio.sleep(RATE_LIMIT["contacts"])
         
         print_success(f"Deleted {len(contact_list)} contacts")
     except Exception as e:
@@ -486,28 +584,42 @@ async def get_dialogs_advanced(client: TelegramClient) -> List[types.Dialog]:
     offset_id = 0
     limit = 100
     
-    with console.status("[bold blue]Fetching dialogs...[/bold blue]", spinner="dots"):
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TimeRemainingColumn(),
+        transient=True
+    ) as progress:
+        task = progress.add_task("[blue]Fetching dialogs...[/blue]", total=None)
+        
         while True:
-            result = await client(GetDialogsRequest(
-                offset_date=offset_date,
-                offset_id=offset_id,
-                offset_peer=types.InputPeerEmpty(),
-                limit=limit,
-                hash=0
-            ))
-            
-            if not result.dialogs:
+            try:
+                result = await client(GetDialogsRequest(
+                    offset_date=offset_date,
+                    offset_id=offset_id,
+                    offset_peer=types.InputPeerEmpty(),
+                    limit=limit,
+                    hash=0
+                ))
+                
+                if not result.dialogs:
+                    break
+                    
+                dialogs.extend(result.dialogs)
+                progress.update(task, description=f"Fetched {len(dialogs)} dialogs")
+                
+                if len(result.dialogs) < limit:
+                    break
+                    
+                last_dialog = result.dialogs[-1]
+                offset_date = last_dialog.date
+                offset_id = last_dialog.id
+                
+            except Exception as e:
+                print_warning(f"Error fetching dialogs: {str(e)}")
                 break
                 
-            dialogs.extend(result.dialogs)
-            
-            if len(result.dialogs) < limit:
-                break
-                
-            last_dialog = result.dialogs[-1]
-            offset_date = last_dialog.date
-            offset_id = last_dialog.id
-            
     return dialogs
 
 async def delete_all_chats_advanced() -> None:
@@ -521,24 +633,31 @@ async def delete_all_chats_advanced() -> None:
         dialogs = await get_dialogs_advanced(client)
         
         # Filter out special chats and empty dialogs
-        dialogs = [
-            d for d in dialogs 
-            if d.id not in (777000, 429000) 
-            and hasattr(d, 'entity')
-        ]
+        valid_dialogs = []
+        for dialog in dialogs:
+            if not hasattr(dialog, 'entity'):
+                continue
+            if dialog.id in (777000, 429000):
+                continue
+            valid_dialogs.append(dialog)
         
-        if not dialogs:
+        if not valid_dialogs:
             print_info("No chats/channels found")
             return
             
         # Display chat info
-        table = Table(title=f"Found {len(dialogs)} Chats/Channels", box=box.ROUNDED)
+        table = Table(
+            title=f"Found {len(valid_dialogs)} Chats/Channels",
+            box=box.ROUNDED,
+            header_style="bold magenta",
+            row_styles=["dim", ""]
+        )
         table.add_column("Type", style="cyan")
         table.add_column("Title", style="magenta")
         table.add_column("ID", style="green")
         table.add_column("Messages", style="yellow")
         
-        for dialog in dialogs[:10]:  # Show first 10
+        for dialog in valid_dialogs[:10]:  # Show first 10
             chat_type = "Channel" if isinstance(dialog.entity, types.Channel) else "Chat"
             table.add_row(
                 chat_type,
@@ -548,8 +667,8 @@ async def delete_all_chats_advanced() -> None:
             )
         
         console.print(table)
-        if len(dialogs) > 10:
-            console.print(f"[yellow]...and {len(dialogs)-10} more chats/channels[/yellow]")
+        if len(valid_dialogs) > 10:
+            console.print(f"[yellow]...and {len(valid_dialogs)-10} more chats/channels[/yellow]")
             
         confirm = console.input("[bold red]Delete ALL chats/channels? (y/n): [/bold red]").strip().lower()
         if confirm != 'y':
@@ -560,22 +679,24 @@ async def delete_all_chats_advanced() -> None:
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TimeRemainingColumn(),
             transient=True
         ) as progress:
-            task = progress.add_task("[red]Deleting chats...[/red]", total=len(dialogs))
+            task = progress.add_task("[red]Deleting chats...[/red]", total=len(valid_dialogs))
             
-            for dialog in dialogs:
+            for dialog in valid_dialogs:
                 try:
                     if isinstance(dialog.entity, types.Channel):
                         await client(LeaveChannelRequest(dialog.entity))
                     else:
                         await client.delete_dialog(dialog.entity)
                     progress.update(task, advance=1)
-                    await asyncio.sleep(RATE_LIMIT["chats"])  # Rate limiting
+                    await asyncio.sleep(RATE_LIMIT["chats"])
                 except Exception as e:
                     print_warning(f"Failed to delete {getattr(dialog.entity, 'title', 'Unknown')}: {str(e)}")
         
-        print_success(f"Deleted {len(dialogs)} chats/channels")
+        print_success(f"Deleted {len(valid_dialogs)} chats/channels")
     except Exception as e:
         print_error(f"Error: {str(e)}")
     finally:
@@ -598,7 +719,11 @@ async def check_spam_status() -> None:
             except Exception:
                 restricted = True
         
-        table = Table(box=box.ROUNDED)
+        table = Table(
+            box=box.ROUNDED,
+            header_style="bold cyan",
+            row_styles=["dim", ""]
+        )
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="magenta")
         
@@ -633,7 +758,8 @@ async def read_session_otp() -> None:
                     f"[bold]Message:[/bold] {msg.text.splitlines()[0]}\n"
                     f"[bold]Received:[/bold] {msg.date.strftime('%Y-%m-%d %H:%M:%S')}",
                     title="OTP Found",
-                    border_style="green"
+                    border_style="green",
+                    style="bold"
                 )
                 console.print(panel)
                 return
@@ -652,7 +778,7 @@ async def get_random_session_by_country() -> Optional[str]:
         print_error("Country code must start with '+'")
         return None
     
-    sessions = list_sessions(country_code)
+    sessions = await list_sessions(country_code)
     if not sessions:
         return None
         
@@ -686,7 +812,7 @@ async def main() -> None:
     """Main menu with advanced options"""
     menu_options = {
         "1": ("Create New Session", create_session),
-        "2": ("List Saved Sessions", lambda: safe_execute(list_sessions)),
+        "2": ("List Saved Sessions", list_sessions),
         "3": ("Terminate Other Sessions", terminate_other_sessions),
         "4": ("Show Active Sessions", show_active_sessions),
         "5": ("Update Profile", update_profile_random_name),
@@ -702,9 +828,13 @@ async def main() -> None:
         print_header("Telegram Advanced Session Manager")
         
         # Create menu table
-        menu_table = Table.grid(padding=(1, 3))
-        menu_table.add_column(style="cyan", justify="right")
-        menu_table.add_column(style="magenta")
+        menu_table = Table(
+            box=box.ROUNDED,
+            header_style="bold magenta",
+            show_header=False
+        )
+        menu_table.add_column("Option", style="cyan", justify="right")
+        menu_table.add_column("Description", style="magenta")
         
         for num, (desc, _) in menu_options.items():
             menu_table.add_row(num, desc)
@@ -716,9 +846,9 @@ async def main() -> None:
         if choice in menu_options:
             if choice == "11":
                 print_success("Goodbye!")
-                break
+                cleanup()
             elif choice == "2":
-                await menu_options[choice][1]()  # No safe_execute for list_sessions
+                await list_sessions()
             else:
                 await safe_execute(menu_options[choice][1])
         else:
@@ -728,6 +858,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print_error("\nOperation cancelled by user")
+        cleanup()
     except Exception as e:
         print_error(f"Fatal error: {str(e)}")
+        cleanup()
