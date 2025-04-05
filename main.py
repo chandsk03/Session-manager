@@ -3,15 +3,16 @@ import asyncio
 import getpass
 from telethon.sync import TelegramClient
 from telethon.errors import SessionPasswordNeededError, FloodWaitError, PhoneNumberInvalidError
-from telethon.tl.functions.auth import GetAuthorizationsRequest
-from telethon.tl.functions.account import UpdateProfileRequest
+from telethon.tl.functions.account import GetAuthorizationsRequest, ResetAuthorizationsRequest
+from telethon.tl.functions.account import UpdateProfileRequest, GetAccountTTLRequest
 from telethon.tl.functions.contacts import DeleteContactsRequest
-from telethon.tl.functions.messages import DeleteChatRequest
-from telethon.tl.functions.account import GetAccountTTLRequest
+from telethon.tl.functions.messages import DeleteHistoryRequest
+from telethon.tl.functions.channels import LeaveChannelRequest
+from telethon.tl.types import PeerChat, PeerChannel
 from colorama import Fore, Style, init
 import time
 
-# Initialize colorama for cross-platform colored output
+# Initialize colorama
 init(autoreset=True)
 
 # Custom Theme Configuration
@@ -25,7 +26,7 @@ class Theme:
     RESET = Style.RESET_ALL
     TITLE = Style.BRIGHT + Fore.CYAN
 
-# API credentials from environment variables
+# API credentials
 API_ID = int(os.getenv("TELEGRAM_API_ID", "23077946"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "b6c2b715121435d4aa285c1fb2bc2220")
 
@@ -40,7 +41,7 @@ async def create_session():
         if not phone:
             print(f"{Theme.ERROR}❌ Phone number cannot be empty. Please try again.{Theme.RESET}")
             continue
-        if not phone.startswith('+') and not phone.isalnum():  # Basic bot token check
+        if not phone.startswith('+') and not phone.isalnum():
             print(f"{Theme.ERROR}❌ Invalid format. Use + followed by country code and number, or a valid bot token.{Theme.RESET}")
             continue
         break
@@ -81,7 +82,7 @@ async def create_session():
                 return
             except TimeoutError:
                 print(f"{Theme.WARNING}⏳ Connection timeout (attempt {attempt + 1}/3). Retrying...{Theme.RESET}")
-                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                await asyncio.sleep(2 ** attempt)
             except Exception as e:
                 print(f"{Theme.ERROR}❌ Failed to create session: {str(e)}{Theme.RESET}")
                 return
@@ -127,7 +128,6 @@ async def terminate_other_sessions():
     async with TelegramClient(session, API_ID, API_HASH) as client:
         await client.connect()
         try:
-            await client(GetAuthorizationsRequest())
             await client(ResetAuthorizationsRequest())
             print(f"{Theme.SUCCESS}✅ All other sessions terminated successfully.{Theme.RESET}")
         except Exception as e:
@@ -180,7 +180,7 @@ async def clear_contacts():
     async with TelegramClient(session, API_ID, API_HASH) as client:
         await client.connect()
         try:
-            contacts = await client.get_contacts()
+            contacts = [contact async for contact in client.iter_contacts()]
             if not contacts:
                 print(f"{Theme.WARNING}ℹ️ No contacts to clear.{Theme.RESET}")
                 return
@@ -190,7 +190,7 @@ async def clear_contacts():
             print(f"{Theme.ERROR}❌ Failed to clear contacts: {str(e)}{Theme.RESET}")
 
 async def delete_chat():
-    """Delete a selected chat"""
+    """Delete a selected chat or leave a channel"""
     session = select_session()
     if not session:
         return
@@ -200,23 +200,30 @@ async def delete_chat():
         try:
             dialogs = await client.get_dialogs()
             if not dialogs:
-                print(f"{Theme.WARNING}ℹ️ No chats available.{Theme.RESET}")
+                print(f"{Theme.WARNING}ℹ️ No chats or channels available.{Theme.RESET}")
                 return
             
-            print(f"{Theme.INFO}\nAvailable Chats:{Theme.RESET}")
+            print(f"{Theme.INFO}\nAvailable Chats/Channels:{Theme.RESET}")
             for i, dialog in enumerate(dialogs, 1):
-                print(f"{Theme.INFO}{i}. {dialog.title}{Theme.RESET}")
+                print(f"{Theme.INFO}{i}. {dialog.title} ({'Chat' if isinstance(dialog.entity, PeerChat) else 'Channel/Group'}){Theme.RESET}")
             
-            choice = int(input(f"{Theme.PRIMARY}Select chat number to delete (1-{len(dialogs)}): {Theme.RESET}").strip()) - 1
+            choice = int(input(f"{Theme.PRIMARY}Select chat/channel number to delete (1-{len(dialogs)}): {Theme.RESET}").strip()) - 1
             if 0 <= choice < len(dialogs):
-                await client(DeleteChatRequest(chat_id=dialogs[choice].id))
-                print(f"{Theme.SUCCESS}✅ Chat '{dialogs[choice].title}' deleted.{Theme.RESET}")
+                dialog = dialogs[choice]
+                if isinstance(dialog.entity, PeerChat):
+                    await client(DeleteHistoryRequest(peer=dialog.entity, max_id=0, just_clear=True))
+                    print(f"{Theme.SUCCESS}✅ Chat '{dialog.title}' history cleared.{Theme.RESET}")
+                elif isinstance(dialog.entity, PeerChannel):
+                    await client(LeaveChannelRequest(channel=dialog.entity))
+                    print(f"{Theme.SUCCESS}✅ Left channel/group '{dialog.title}'.{Theme.RESET}")
+                else:
+                    print(f"{Theme.ERROR}❌ Unsupported dialog type for '{dialog.title}'.{Theme.RESET}")
             else:
-                print(f"{Theme.ERROR}❌ Invalid chat selection.{Theme.RESET}")
+                print(f"{Theme.ERROR}❌ Invalid selection. Choose a number between 1 and {len(dialogs)}.{Theme.RESET}")
         except ValueError:
             print(f"{Theme.ERROR}❌ Please enter a valid number.{Theme.RESET}")
         except Exception as e:
-            print(f"{Theme.ERROR}❌ Failed to delete chat: {str(e)}{Theme.RESET}")
+            print(f"{Theme.ERROR}❌ Failed to delete chat/channel: {str(e)}{Theme.RESET}")
 
 async def check_spam_status():
     """Check if account is spam-restricted"""
@@ -261,7 +268,7 @@ async def safe_execute(func):
         try:
             return await func()
         except FloodWaitError as e:
-            wait_time = min(e.seconds * (2 ** attempt), 3600)  # Cap at 1 hour
+            wait_time = min(e.seconds * (2 ** attempt), 3600)
             print(f"{Theme.WARNING}⏳ Rate limit hit! Waiting {wait_time} seconds (Attempt {attempt + 1}/{max_attempts})...{Theme.RESET}")
             await asyncio.sleep(wait_time)
         except Exception as e:
@@ -278,7 +285,7 @@ async def main():
         "4": ("Show Active Sessions", show_active_sessions),
         "5": ("Update Profile with Random Name", update_profile_random_name),
         "6": ("Clear Contacts", clear_contacts),
-        "7": ("Delete Chat", delete_chat),
+        "7": ("Delete Chat/Channel", delete_chat),
         "8": ("Check Spam Status", check_spam_status),
         "9": ("Read Session OTP", read_session_otp),
         "10": ("Exit", None)
