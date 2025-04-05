@@ -4,12 +4,7 @@ import getpass
 import random
 import glob
 from telethon import TelegramClient, functions, types
-from telethon.errors import (
-    SessionPasswordNeededError,
-    FloodWaitError,
-    PhoneNumberInvalidError,
-    AuthKeyError
-)
+from telethon.tl.functions.messages import GetDialogsRequest
 from telethon.tl.functions.account import (
     GetAuthorizationsRequest,
     ResetAuthorizationRequest,
@@ -20,11 +15,14 @@ from telethon.tl.functions.contacts import (
     DeleteContactsRequest,
     GetContactsRequest
 )
-from telethon.tl.functions.messages import (
-    DeleteHistoryRequest,
-    GetAllChatsRequest
-)
 from telethon.tl.functions.channels import LeaveChannelRequest
+from telethon.errors import (
+    SessionPasswordNeededError,
+    FloodWaitError,
+    PhoneNumberInvalidError,
+    AuthKeyError,
+    RPCError
+)
 from colorama import Fore, Style, init
 from rich.console import Console
 from rich.table import Table
@@ -32,11 +30,13 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.tree import Tree
 from rich import box
+from rich.text import Text
 import time
 from datetime import datetime
-import socket
 import platform
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
+import socket
+import hashlib
 
 # Initialize colorama and rich console
 init(autoreset=True)
@@ -65,15 +65,24 @@ if not os.path.exists(SESSION_FOLDER):
 
 # Device information
 DEVICE_INFO = {
-    "device_model": "Telegram Session Manager",
+    "device_model": "Telegram Session Manager Pro",
     "system_version": platform.platform(),
-    "app_version": "2.0",
-    "lang_code": "en"
+    "app_version": "3.0",
+    "lang_code": "en",
+    "system_lang_code": "en-US"
+}
+
+# Rate limiting configuration
+RATE_LIMIT = {
+    "contacts": 1.2,  # seconds between operations
+    "chats": 1.5,
+    "messages": 0.8
 }
 
 def get_session_path(phone: str) -> str:
     """Generate session file path from phone number"""
-    return os.path.join(SESSION_FOLDER, f"{phone.replace('+', '')}.session")
+    sanitized = ''.join(c for c in phone if c.isdigit() or c == '+')
+    return os.path.join(SESSION_FOLDER, f"{sanitized.replace('+', '')}.session")
 
 def print_header(title: str) -> None:
     """Print formatted header with rich"""
@@ -95,8 +104,15 @@ def print_info(message: str) -> None:
     """Print info message"""
     console.print(f"[bold blue]ℹ {message}[/bold blue]")
 
+def validate_phone(phone: str) -> bool:
+    """Validate phone number format"""
+    if not phone.startswith('+'):
+        return False
+    digits = phone[1:]
+    return digits.isdigit() and len(digits) >= 8
+
 async def login_session(session_path: str) -> Optional[TelegramClient]:
-    """Login to a session with improved error handling"""
+    """Advanced session login with error handling and device spoofing"""
     try:
         client = TelegramClient(
             session_path,
@@ -105,7 +121,11 @@ async def login_session(session_path: str) -> Optional[TelegramClient]:
             device_model=DEVICE_INFO["device_model"],
             system_version=DEVICE_INFO["system_version"],
             app_version=DEVICE_INFO["app_version"],
-            lang_code=DEVICE_INFO["lang_code"]
+            lang_code=DEVICE_INFO["lang_code"],
+            system_lang_code=DEVICE_INFO["system_lang_code"],
+            request_retries=5,
+            connection_retries=5,
+            auto_reconnect=True
         )
         
         await client.connect()
@@ -116,81 +136,20 @@ async def login_session(session_path: str) -> Optional[TelegramClient]:
             return None
             
         session_name = os.path.basename(session_path)
-        print_success(f"Logged in as {session_name}")
+        me = await client.get_me()
+        print_success(f"Logged in as [bold]{me.first_name or 'Unknown'}[/bold] (ID: {me.id})")
         return client
         
     except AuthKeyError:
         print_error("Session expired or invalid. Please create a new session.")
-        os.remove(session_path)
+        try:
+            os.remove(session_path)
+        except:
+            pass
         return None
     except Exception as e:
         print_error(f"Login failed: {str(e)}")
         return None
-
-def list_sessions(country_code: Optional[str] = None) -> Optional[List[str]]:
-    """List all saved session files with rich table"""
-    sessions_pattern = os.path.join(SESSION_FOLDER, "*.session")
-    sessions = glob.glob(sessions_pattern)
-    
-    if country_code:
-        country_code = country_code.replace('+', '')
-        sessions = [s for s in sessions if os.path.basename(s).startswith(country_code)]
-    
-    if not sessions:
-        print_warning("No saved sessions found")
-        return None
-    
-    table = Table(title="Available Sessions", box=box.ROUNDED)
-    table.add_column("#", style="cyan", justify="right")
-    table.add_column("Phone Number", style="magenta")
-    table.add_column("Session File", style="yellow")
-    table.add_column("Size", style="green")
-    
-    for i, session in enumerate(sessions, 1):
-        session_name = os.path.basename(session).replace('.session', '')
-        size = os.path.getsize(session) / 1024  # KB
-        table.add_row(
-            str(i),
-            f"+{session_name}",
-            os.path.basename(session),
-            f"{size:.2f} KB"
-        )
-    
-    console.print(table)
-    return sessions
-
-async def select_and_login() -> Optional[TelegramClient]:
-    """Select a session and login with retry logic"""
-    sessions = list_sessions()
-    if not sessions:
-        return None
-    
-    while True:
-        try:
-            choice = console.input("[bold cyan]Select session (1-{}): [/bold cyan]".format(
-                len(sessions)
-            ).strip()
-            
-            if not choice:
-                print_error("Selection cannot be empty")
-                continue
-                
-            choice = int(choice) - 1
-            if 0 <= choice < len(sessions):
-                session_path = sessions[choice]
-                
-                with console.status("[bold blue]Connecting...[/bold blue]", spinner="dots"):
-                    client = await login_session(session_path)
-                
-                if client:
-                    return client
-                
-                print_warning("Login failed, please try another session")
-                continue
-                
-            print_error(f"Invalid selection. Choose between 1 and {len(sessions)}")
-        except ValueError:
-            print_error("Please enter a valid number")
 
 async def create_session() -> Optional[str]:
     """Create a new Telegram session with enhanced validation"""
@@ -198,11 +157,8 @@ async def create_session() -> Optional[str]:
     
     while True:
         phone = console.input("[bold cyan]Enter phone number (e.g., +12345678900): [/bold cyan]").strip()
-        if not phone:
-            print_error("Phone number cannot be empty")
-            continue
-        if not phone.startswith('+'):
-            print_error("Invalid format. Must start with '+'")
+        if not validate_phone(phone):
+            print_error("Invalid phone number format. Must start with '+' followed by digits")
             continue
         break
     
@@ -218,7 +174,8 @@ async def create_session() -> Optional[str]:
         device_model=DEVICE_INFO["device_model"],
         system_version=DEVICE_INFO["system_version"],
         app_version=DEVICE_INFO["app_version"],
-        lang_code=DEVICE_INFO["lang_code"]
+        lang_code=DEVICE_INFO["lang_code"],
+        system_lang_code=DEVICE_INFO["system_lang_code"]
     )
     
     try:
@@ -254,10 +211,81 @@ async def create_session() -> Optional[str]:
     except Exception as e:
         print_error(f"Failed to create session: {str(e)}")
         if os.path.exists(session_path):
-            os.remove(session_path)
+            try:
+                os.remove(session_path)
+            except:
+                pass
     finally:
         await client.disconnect()
     return None
+
+def list_sessions(country_code: Optional[str] = None) -> Optional[List[str]]:
+    """List all saved session files with rich table"""
+    sessions_pattern = os.path.join(SESSION_FOLDER, "*.session")
+    sessions = glob.glob(sessions_pattern)
+    
+    if country_code:
+        country_code = country_code.replace('+', '')
+        sessions = [s for s in sessions if os.path.basename(s).startswith(country_code)]
+    
+    if not sessions:
+        print_warning("No saved sessions found")
+        return None
+    
+    table = Table(title="Available Sessions", box=box.ROUNDED)
+    table.add_column("#", style="cyan", justify="right")
+    table.add_column("Phone Number", style="magenta")
+    table.add_column("Session File", style="yellow")
+    table.add_column("Size", style="green")
+    table.add_column("Last Modified", style="blue")
+    
+    for i, session in enumerate(sessions, 1):
+        session_name = os.path.basename(session).replace('.session', '')
+        size = os.path.getsize(session) / 1024  # KB
+        mtime = datetime.fromtimestamp(os.path.getmtime(session))
+        table.add_row(
+            str(i),
+            f"+{session_name}",
+            os.path.basename(session),
+            f"{size:.2f} KB",
+            mtime.strftime('%Y-%m-%d %H:%M')
+        )
+    
+    console.print(table)
+    return sessions
+
+async def select_and_login() -> Optional[TelegramClient]:
+    """Select a session and login with retry logic"""
+    sessions = list_sessions()
+    if not sessions:
+        return None
+    
+    while True:
+        try:
+            choice = console.input(
+                f"[bold cyan]Select session (1-{len(sessions)}): [/bold cyan]"
+            ).strip()
+            
+            if not choice:
+                print_error("Selection cannot be empty")
+                continue
+                
+            choice = int(choice) - 1
+            if 0 <= choice < len(sessions):
+                session_path = sessions[choice]
+                
+                with console.status("[bold blue]Connecting...[/bold blue]", spinner="dots"):
+                    client = await login_session(session_path)
+                
+                if client:
+                    return client
+                
+                print_warning("Login failed, please try another session")
+                continue
+                
+            print_error(f"Invalid selection. Choose between 1 and {len(sessions)}")
+        except ValueError:
+            print_error("Please enter a valid number")
 
 async def terminate_other_sessions() -> None:
     """Terminate all sessions except current one with confirmation"""
@@ -372,15 +400,20 @@ async def update_profile_random_name() -> None:
         
         # Generate random name with emoji
         emojis = ["🚀", "🌟", "🔥", "💻", "🦾", "🤖", "👾", "🛸"]
-        new_name = f"User_{random.randint(1000, 9999)} {random.choice(emojis)}"
+        adjectives = ["Cyber", "Digital", "Quantum", "Neon", "Phantom", "Stealth"]
+        nouns = ["Hacker", "Agent", "Ghost", "Ninja", "Samurai", "Wizard"]
+        
+        new_first = f"{random.choice(adjectives)}{random.choice(nouns)}"
+        new_last = random.choice(emojis)
         
         with console.status("[bold blue]Updating profile...[/bold blue]", spinner="dots"):
             await client(UpdateProfileRequest(
-                first_name=new_name,
-                last_name=""
+                first_name=new_first,
+                last_name=new_last,
+                about=f"Updated by Telegram Session Manager at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             ))
         
-        print_success(f"Profile updated from '[bold]{old_name}[/bold]' to '[bold]{new_name}[/bold]'")
+        print_success(f"Profile updated from '[bold]{old_name}[/bold]' to '[bold]{new_first} {new_last}[/bold]'")
     except Exception as e:
         print_error(f"Failed to update profile: {str(e)}")
     finally:
@@ -438,7 +471,7 @@ async def clear_contacts() -> None:
                 batch = contact_list[i:i+batch_size]
                 await client(DeleteContactsRequest(id=[c.user_id for c in batch]))
                 progress.update(task, advance=len(batch))
-                await asyncio.sleep(1)  # Rate limiting
+                await asyncio.sleep(RATE_LIMIT["contacts"])  # Rate limiting
         
         print_success(f"Deleted {len(contact_list)} contacts")
     except Exception as e:
@@ -446,17 +479,53 @@ async def clear_contacts() -> None:
     finally:
         await client.disconnect()
 
-async def delete_all_chats() -> None:
-    """Delete all chats, groups, and channels"""
-    print_header("Delete All Chats")
+async def get_dialogs_advanced(client: TelegramClient) -> List[types.Dialog]:
+    """Advanced dialog fetching with pagination"""
+    dialogs = []
+    offset_date = None
+    offset_id = 0
+    limit = 100
+    
+    with console.status("[bold blue]Fetching dialogs...[/bold blue]", spinner="dots"):
+        while True:
+            result = await client(GetDialogsRequest(
+                offset_date=offset_date,
+                offset_id=offset_id,
+                offset_peer=types.InputPeerEmpty(),
+                limit=limit,
+                hash=0
+            ))
+            
+            if not result.dialogs:
+                break
+                
+            dialogs.extend(result.dialogs)
+            
+            if len(result.dialogs) < limit:
+                break
+                
+            last_dialog = result.dialogs[-1]
+            offset_date = last_dialog.date
+            offset_id = last_dialog.id
+            
+    return dialogs
+
+async def delete_all_chats_advanced() -> None:
+    """Advanced chat deletion with GetDialogsRequest"""
+    print_header("Advanced Chat Deletion")
     client = await select_and_login()
     if not client:
         return
     
     try:
-        with console.status("[bold blue]Fetching chats...[/bold blue]", spinner="dots"):
-            dialogs = await client.get_dialogs(limit=None)
-            dialogs = [d for d in dialogs if d.id not in (777000, 429000)]  # Filter special chats
+        dialogs = await get_dialogs_advanced(client)
+        
+        # Filter out special chats and empty dialogs
+        dialogs = [
+            d for d in dialogs 
+            if d.id not in (777000, 429000) 
+            and hasattr(d, 'entity')
+        ]
         
         if not dialogs:
             print_info("No chats/channels found")
@@ -467,16 +536,16 @@ async def delete_all_chats() -> None:
         table.add_column("Type", style="cyan")
         table.add_column("Title", style="magenta")
         table.add_column("ID", style="green")
+        table.add_column("Messages", style="yellow")
         
         for dialog in dialogs[:10]:  # Show first 10
-            chat_type = ""
-            if dialog.is_channel:
-                chat_type = "Channel"
-            elif dialog.is_group:
-                chat_type = "Group"
-            else:
-                chat_type = "Chat"
-            table.add_row(chat_type, dialog.name, str(dialog.id))
+            chat_type = "Channel" if isinstance(dialog.entity, types.Channel) else "Chat"
+            table.add_row(
+                chat_type,
+                getattr(dialog.entity, 'title', 'Unknown'),
+                str(dialog.entity.id),
+                str(dialog.top_message)
+            )
         
         console.print(table)
         if len(dialogs) > 10:
@@ -497,14 +566,14 @@ async def delete_all_chats() -> None:
             
             for dialog in dialogs:
                 try:
-                    if dialog.is_channel:
+                    if isinstance(dialog.entity, types.Channel):
                         await client(LeaveChannelRequest(dialog.entity))
                     else:
-                        await client.delete_dialog(dialog)
+                        await client.delete_dialog(dialog.entity)
                     progress.update(task, advance=1)
-                    await asyncio.sleep(1)  # Rate limiting
+                    await asyncio.sleep(RATE_LIMIT["chats"])  # Rate limiting
                 except Exception as e:
-                    print_warning(f"Failed to delete {dialog.name}: {str(e)}")
+                    print_warning(f"Failed to delete {getattr(dialog.entity, 'title', 'Unknown')}: {str(e)}")
         
         print_success(f"Deleted {len(dialogs)} chats/channels")
     except Exception as e:
@@ -601,6 +670,11 @@ async def safe_execute(func) -> Any:
             wait_time = min(e.seconds, 3600)  # Max 1 hour wait
             print_warning(f"Flood wait: {wait_time} seconds (Attempt {attempt + 1}/{max_attempts})")
             await asyncio.sleep(wait_time)
+        except RPCError as e:
+            print_error(f"Telegram RPC error: {str(e)}")
+            if attempt == max_attempts - 1:
+                return None
+            await asyncio.sleep(2 ** attempt)
         except Exception as e:
             print_error(f"Attempt {attempt + 1} failed: {str(e)}")
             if attempt == max_attempts - 1:
@@ -609,7 +683,7 @@ async def safe_execute(func) -> Any:
     return None
 
 async def main() -> None:
-    """Main menu loop"""
+    """Main menu with advanced options"""
     menu_options = {
         "1": ("Create New Session", create_session),
         "2": ("List Saved Sessions", lambda: safe_execute(list_sessions)),
@@ -617,7 +691,7 @@ async def main() -> None:
         "4": ("Show Active Sessions", show_active_sessions),
         "5": ("Update Profile", update_profile_random_name),
         "6": ("Clear Contacts", clear_contacts),
-        "7": ("Delete All Chats", delete_all_chats),
+        "7": ("Advanced Chat Deletion", delete_all_chats_advanced),
         "8": ("Check Spam Status", check_spam_status),
         "9": ("Read OTP", read_session_otp),
         "10": ("Random Session by Country", get_random_session_by_country),
@@ -625,7 +699,7 @@ async def main() -> None:
     }
     
     while True:
-        print_header("Telegram Session Manager")
+        print_header("Telegram Advanced Session Manager")
         
         # Create menu table
         menu_table = Table.grid(padding=(1, 3))
