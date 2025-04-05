@@ -3,7 +3,7 @@ import asyncio
 import getpass
 from telethon.sync import TelegramClient
 from telethon.errors import SessionPasswordNeededError, FloodWaitError, PhoneNumberInvalidError
-from telethon.tl.functions.account import GetAuthorizationsRequest, ResetAuthorizationsRequest
+from telethon.tl.functions.account import GetAuthorizationsRequest, ResetAuthorizationRequest
 from telethon.tl.functions.account import UpdateProfileRequest, GetAccountTTLRequest
 from telethon.tl.functions.contacts import DeleteContactsRequest
 from telethon.tl.functions.messages import DeleteHistoryRequest
