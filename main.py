@@ -13,7 +13,7 @@ import shutil
 import aiofiles
 import aiohttp
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, AsyncGenerator
 from concurrent.futures import ThreadPoolExecutor
 from cryptography.fernet import Fernet
 from hashlib import sha256
@@ -22,6 +22,7 @@ import logging
 import threading
 from importlib.metadata import version
 from pathlib import Path
+from contextlib import asynccontextmanager
 
 # Telegram Imports
 from telethon import TelegramClient, functions, types, __version__ as telethon_version
@@ -206,7 +207,7 @@ class SessionSecurity:
                     await f.write(encrypted)
                 
                 os.remove(session_path)
-                async with cls._db_connection() as conn:
+                async with cls.db_connection() as conn:
                     conn.execute("UPDATE sessions SET encrypted = 1, path = ? WHERE phone = ?", (encrypted_path, phone))
                 console.print("[bold green]✓ Session encrypted successfully[/bold green]")
                 logger.info(f"Session encrypted: {session_path}")
@@ -229,7 +230,7 @@ class SessionSecurity:
                 async with aiofiles.open(clean_path, 'wb') as f:
                     await f.write(decrypted)
                 
-                async with cls._db_connection() as conn:
+                async with cls.db_connection() as conn:
                     conn.execute("UPDATE sessions SET encrypted = 0, path = ? WHERE phone = ?", (clean_path, phone))
                 logger.info(f"Session decrypted: {session_path}")
                 return clean_path
@@ -245,12 +246,14 @@ class SessionSecurity:
         return cls._cipher_cache[config.ENCRYPTION_KEY]
 
     @classmethod
-    async def _db_connection(cls):
+    @asynccontextmanager
+    async def db_connection(cls):
         conn = sqlite3.connect(config.DB_PATH, timeout=20)
         conn.execute("PRAGMA busy_timeout = 20000")
         try:
             yield conn
         finally:
+            conn.commit()
             conn.close()
 
 class AdvancedTelegramClient:
@@ -303,7 +306,7 @@ class AdvancedTelegramClient:
                         return False
                     self._me = await self.client.get_me()
                     console.print(f"[bold green]✓ Connected as {self._me.first_name} (ID: {self._me.id})[/bold green]")
-                    async with SessionSecurity._db_connection() as conn:
+                    async with SessionSecurity.db_connection() as conn:
                         conn.execute(
                             "UPDATE sessions SET last_used = ?, session_hash = ? WHERE phone = ?",
                             (datetime.now(timezone.utc).isoformat(), self._generate_session_hash(), self.phone)
@@ -406,7 +409,7 @@ async def create_session() -> Optional[str]:
                         "premium": me.premium,
                         "language": me.lang_code
                     }
-                    async with SessionSecurity._db_connection() as conn:
+                    async with SessionSecurity.db_connection() as conn:
                         conn.execute(
                             "INSERT OR REPLACE INTO sessions (phone, path, created_at, last_used, metadata, session_hash) VALUES (?, ?, ?, ?, ?, ?)",
                             (phone, session_path, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat(), json.dumps(metadata), client._generate_session_hash())
@@ -442,7 +445,7 @@ async def list_sessions(country_code: Optional[str] = None, status_filter: str =
     table.add_column("Hash", style="white")
     
     filtered_sessions = []
-    async with SessionSecurity._db_connection() as conn:
+    async with SessionSecurity.db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT phone, path, last_used, metadata, session_hash, status FROM sessions WHERE status = ?", (status_filter,))
         db_sessions = {row[0]: row for row in cursor.fetchall()}
@@ -869,7 +872,7 @@ async def export_sessions() -> None:
         return
     
     try:
-        async with SessionSecurity._db_connection() as conn:
+        async with SessionSecurity.db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT phone, path, created_at, last_used, encrypted, metadata, session_hash, status FROM sessions")
             data = cursor.fetchall()
@@ -890,7 +893,7 @@ async def export_sessions() -> None:
 async def session_statistics() -> None:
     print_header("Session Statistics")
     try:
-        async with SessionSecurity._db_connection() as conn:
+        async with SessionSecurity.db_connection() as conn:
             cursor = conn.cursor()
             stats = {
                 "Total Sessions": cursor.execute("SELECT COUNT(*) FROM sessions").fetchone()[0],
@@ -947,7 +950,7 @@ async def cleanup_sessions() -> None:
         print_info("No sessions to clean")
         return
     
-    async with SessionSecurity._db_connection() as conn:
+    async with SessionSecurity.db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT path FROM sessions WHERE status = 'active'")
         db_paths = set(row[0] for row in cursor.fetchall())
@@ -1012,7 +1015,7 @@ async def bulk_session_check() -> None:
     
     unhealthy = [r["phone"] for r in results if "Healthy" not in r["status"]]
     if unhealthy and Confirm.ask("[bold yellow]Mark unhealthy sessions as inactive?[/bold yellow]"):
-        async with SessionSecurity._db_connection() as conn:
+        async with SessionSecurity.db_connection() as conn:
             conn.executemany("UPDATE sessions SET status = 'inactive' WHERE phone = ?", [(p,) for p in unhealthy])
         print_success(f"Marked {len(unhealthy)} sessions as inactive")
         logger.info(f"Marked {len(unhealthy)} sessions as inactive")
