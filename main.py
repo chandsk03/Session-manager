@@ -9,13 +9,14 @@ import signal
 import sys
 import sqlite3
 import json
+import shutil
 from datetime import datetime
 from typing import List, Optional, Dict, Any, Tuple
 from cryptography.fernet import Fernet
 from hashlib import sha256
 import base64
 import logging
-import pkg_resources
+from importlib.metadata import version
 
 # Ensure logs directory exists
 if not os.path.exists('logs'):
@@ -107,9 +108,9 @@ class SecureConfig:
         self.RETRY_DELAY = 2
         self.DB_PATH = "sessions.db"
         self.LOG_LEVEL = self._get_env("LOG_LEVEL", "INFO")
-        self.TELETHON_VERSION = pkg_resources.parse_version(telethon_version)
+        self.TELETHON_VERSION = version('telethon')
         self._setup_folders()
-        self._setup_database()
+        self._migrate_database()
         
     def _get_env(self, var: str, default: str) -> str:
         value = os.getenv(var, default)
@@ -137,7 +138,30 @@ class SecureConfig:
     def _setup_folders(self):
         os.makedirs(self.SESSION_FOLDER, exist_ok=True)
     
-    def _setup_database(self):
+    def _migrate_database(self):
+        """Migrate database schema if needed"""
+        if not os.path.exists(self.DB_PATH):
+            self._create_database()
+            return
+            
+        # Backup existing database
+        backup_path = f"sessions_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        shutil.copy2(self.DB_PATH, backup_path)
+        console.print(f"[bold blue]ℹ Created database backup: {backup_path}[/bold blue]")
+        logging.info(f"Created database backup: {backup_path}")
+        
+        with sqlite3.connect(self.DB_PATH) as conn:
+            cursor = conn.cursor()
+            # Check if metadata column exists
+            cursor.execute("PRAGMA table_info(sessions)")
+            columns = [col[1] for col in cursor.fetchall()]
+            if 'metadata' not in columns:
+                console.print("[bold yellow]⚠ Migrating database to add metadata column[/bold yellow]")
+                cursor.execute("ALTER TABLE sessions ADD COLUMN metadata TEXT")
+                conn.commit()
+                logging.info("Database migrated: added metadata column")
+    
+    def _create_database(self):
         with sqlite3.connect(self.DB_PATH) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
@@ -149,6 +173,7 @@ class SecureConfig:
                     metadata TEXT
                 )
             """)
+            logging.info("Created new sessions database")
 
 config = SecureConfig()
 
@@ -243,7 +268,7 @@ class AdvancedTelegramClient:
         }
         
         # Only add supported parameters based on telethon version
-        if config.TELETHON_VERSION >= pkg_resources.parse_version("1.24.0"):
+        if config.TELETHON_VERSION >= '1.24.0':
             client_params.update({
                 'request_retries': 5,
                 'connection_retries': 5,
@@ -409,7 +434,8 @@ async def list_sessions(country_code: Optional[str] = None) -> Optional[List[str
             cursor.execute("SELECT last_used, metadata FROM sessions WHERE phone = ?", (f"+{session_name}",))
             result = cursor.fetchone()
             last_used_str = result[0] if result and result[0] else "Never"
-            username = json.loads(result[1])["username"] if result and result[1] else "N/A"
+            metadata = json.loads(result[1]) if result and result[1] else {}
+            username = metadata.get("username", "N/A")
             table.add_row(
                 str(i),
                 f"+{session_name}",
@@ -697,21 +723,25 @@ async def read_session_otp() -> None:
         print_error(f"Failed to read OTP: {str(e)}")
         logging.error(f"Failed to read OTP: {str(e)}")
 
-async def get_random_session_by_country() -> Optional[str]:
+async def get_random_session_by_country() -> None:
     """Get random session by country code"""
     print_header("Random Session by Country")
     country_code = console.input("[bold cyan]Enter country code (e.g., +91): [/bold cyan]").strip()
     if not country_code.startswith('+'):
         print_error("Country code must start with '+'")
-        return None
+        return
     
     sessions = await list_sessions(country_code)
     if not sessions:
-        return None
+        return
     session = random.choice(sessions)
-    print_success(f"Selected: {os.path.basename(session)}")
-    logging.info(f"Random session selected: {session}")
-    return session
+    phone = f"+{os.path.basename(session).replace('.session', '').replace('.enc', '')}"
+    client = AdvancedTelegramClient(session, phone)
+    if await client.connect():
+        print_success(f"Selected and logged into: {os.path.basename(session)}")
+        logging.info(f"Random session selected and logged in: {session}")
+    else:
+        print_error("Failed to login to selected session")
 
 async def manage_2fa() -> None:
     """2FA management menu"""
