@@ -8,19 +8,21 @@ import platform
 import signal
 import sys
 import sqlite3
+import json
 from datetime import datetime
 from typing import List, Optional, Dict, Any, Tuple
 from cryptography.fernet import Fernet
 from hashlib import sha256
 import base64
 import logging
+import pkg_resources
 
-# Ensure logs directory exists before logging configuration
+# Ensure logs directory exists
 if not os.path.exists('logs'):
     os.makedirs('logs')
 
 # Telegram Imports
-from telethon import TelegramClient, functions, types
+from telethon import TelegramClient, functions, types, __version__ as telethon_version
 from telethon.tl.functions.messages import GetDialogsRequest
 from telethon.tl.functions.account import (
     GetAuthorizationsRequest,
@@ -63,12 +65,13 @@ from rich.columns import Columns
 init(autoreset=True)
 console = Console()
 
-# Configure logging after directory creation
+# Configure logging with rotation
+from logging.handlers import RotatingFileHandler
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(levelname)s - %(message)s - [%(filename)s:%(lineno)d]',
     handlers=[
-        logging.FileHandler('logs/session_manager.log'),
+        RotatingFileHandler('logs/session_manager.log', maxBytes=10485760, backupCount=5),
         logging.StreamHandler()
     ]
 )
@@ -103,6 +106,8 @@ class SecureConfig:
         self.MAX_RETRIES = 5
         self.RETRY_DELAY = 2
         self.DB_PATH = "sessions.db"
+        self.LOG_LEVEL = self._get_env("LOG_LEVEL", "INFO")
+        self.TELETHON_VERSION = pkg_resources.parse_version(telethon_version)
         self._setup_folders()
         self._setup_database()
         
@@ -122,7 +127,7 @@ class SecureConfig:
         if not key:
             key = base64.urlsafe_b64encode(os.urandom(32)).decode()
             console.print(f"[bold yellow]⚠ Generated new encryption key: {key}[/bold yellow]")
-            console.print(f"[bold yellow]⚐ Please set this as SESSION_ENCRYPTION_KEY in your environment[/bold yellow]")
+            console.print(f"[bold yellow]⚐ Set this as SESSION_ENCRYPTION_KEY in your environment[/bold yellow]")
         try:
             return base64.urlsafe_b64decode(key.encode())
         except:
@@ -131,7 +136,6 @@ class SecureConfig:
     
     def _setup_folders(self):
         os.makedirs(self.SESSION_FOLDER, exist_ok=True)
-        # logs directory is already created before logging config
     
     def _setup_database(self):
         with sqlite3.connect(self.DB_PATH) as conn:
@@ -141,7 +145,8 @@ class SecureConfig:
                     path TEXT,
                     created_at TIMESTAMP,
                     last_used TIMESTAMP,
-                    encrypted INTEGER DEFAULT 0
+                    encrypted INTEGER DEFAULT 0,
+                    metadata TEXT
                 )
             """)
 
@@ -151,7 +156,7 @@ class SessionSecurity:
     """Handles session encryption/decryption and database management"""
     
     @staticmethod
-    def encrypt_session(session_path: str) -> None:
+    def encrypt_session(session_path: str, phone: str) -> None:
         if not config.ENCRYPTION_KEY:
             return
             
@@ -168,8 +173,8 @@ class SessionSecurity:
             os.remove(session_path)
             with sqlite3.connect(config.DB_PATH) as conn:
                 conn.execute(
-                    "UPDATE sessions SET encrypted = 1 WHERE path = ?",
-                    (session_path,)
+                    "UPDATE sessions SET encrypted = 1, path = ? WHERE phone = ?",
+                    (encrypted_path, phone)
                 )
             console.print("[bold green]✓ Session encrypted successfully[/bold green]")
             logging.info(f"Session encrypted: {session_path}")
@@ -178,7 +183,7 @@ class SessionSecurity:
             logging.error(f"Encryption failed for {session_path}: {str(e)}")
     
     @staticmethod
-    def decrypt_session(session_path: str) -> Optional[str]:
+    def decrypt_session(session_path: str, phone: str) -> Optional[str]:
         if not session_path.endswith('.enc') or not config.ENCRYPTION_KEY:
             return session_path
             
@@ -194,8 +199,8 @@ class SessionSecurity:
             
             with sqlite3.connect(config.DB_PATH) as conn:
                 conn.execute(
-                    "UPDATE sessions SET encrypted = 0 WHERE path = ?",
-                    (clean_path,)
+                    "UPDATE sessions SET encrypted = 0, path = ? WHERE phone = ?",
+                    (clean_path, phone)
                 )
             logging.info(f"Session decrypted: {session_path}")
             return clean_path
@@ -205,10 +210,11 @@ class SessionSecurity:
             return None
 
 class AdvancedTelegramClient:
-    """Enhanced Telegram client with built-in security"""
+    """Enhanced Telegram client with advanced features"""
     
-    def __init__(self, session_path: str):
+    def __init__(self, session_path: str, phone: str):
         self.session_path = session_path
+        self.phone = phone
         self.client = None
         self._me = None
         
@@ -220,25 +226,31 @@ class AdvancedTelegramClient:
         await self.disconnect()
         
     async def connect(self) -> bool:
-        """Connect with advanced error handling"""
-        decrypted_path = SessionSecurity.decrypt_session(self.session_path)
+        """Connect with version-aware parameters"""
+        decrypted_path = SessionSecurity.decrypt_session(self.session_path, self.phone)
         if not decrypted_path:
             return False
             
-        self.client = TelegramClient(
-            decrypted_path,
-            config.API_ID,
-            config.API_HASH,
-            device_model="Telegram Session Manager Pro",
-            system_version=platform.platform(),
-            app_version="5.0",
-            lang_code="en",
-            system_lang_code="en-US",
-            request_retries=5,
-            connection_retries=5,
-            auto_reconnect=True,
-            connection_timeout=30
-        )
+        client_params = {
+            'session': decrypted_path,
+            'api_id': config.API_ID,
+            'api_hash': config.API_HASH,
+            'device_model': "Telegram Session Manager Pro",
+            'system_version': platform.platform(),
+            'app_version': "5.0",
+            'lang_code': "en",
+            'system_lang_code': "en-US"
+        }
+        
+        # Only add supported parameters based on telethon version
+        if config.TELETHON_VERSION >= pkg_resources.parse_version("1.24.0"):
+            client_params.update({
+                'request_retries': 5,
+                'connection_retries': 5,
+                'auto_reconnect': True
+            })
+        
+        self.client = TelegramClient(**client_params)
         
         try:
             await self.client.connect()
@@ -249,8 +261,8 @@ class AdvancedTelegramClient:
             console.print(f"[bold green]✓ Connected as {self._me.first_name} (ID: {self._me.id})[/bold green]")
             with sqlite3.connect(config.DB_PATH) as conn:
                 conn.execute(
-                    "UPDATE sessions SET last_used = ? WHERE path = ?",
-                    (datetime.now(), decrypted_path)
+                    "UPDATE sessions SET last_used = ? WHERE phone = ?",
+                    (datetime.now(), self.phone)
                 )
             return True
         except Exception as e:
@@ -287,7 +299,7 @@ def print_header(title: str) -> None:
         title,
         style="bold cyan",
         border_style="blue",
-        subtitle="Telegram Session Manager v5.0"
+        subtitle=f"Telegram Session Manager v5.0 (Telethon {telethon_version})"
     ))
 
 def print_success(message: str) -> None:
@@ -324,7 +336,7 @@ async def create_session() -> Optional[str]:
         print_warning(f"Session already exists for {phone}")
         return session_path
     
-    async with AdvancedTelegramClient(session_path) as client:
+    async with AdvancedTelegramClient(session_path, phone) as client:
         if not await client.connect():
             async with TelegramClient(session_path, config.API_ID, config.API_HASH) as temp_client:
                 try:
@@ -342,12 +354,18 @@ async def create_session() -> Optional[str]:
                         await temp_client.sign_in(password=password)
                     
                     me = await temp_client.get_me()
+                    metadata = {
+                        "username": me.username,
+                        "first_name": me.first_name,
+                        "last_name": me.last_name,
+                        "premium": me.premium
+                    }
                     with sqlite3.connect(config.DB_PATH) as conn:
                         conn.execute(
-                            "INSERT OR REPLACE INTO sessions (phone, path, created_at, last_used) VALUES (?, ?, ?, ?)",
-                            (phone, session_path, datetime.now(), datetime.now())
+                            "INSERT OR REPLACE INTO sessions (phone, path, created_at, last_used, metadata) VALUES (?, ?, ?, ?, ?)",
+                            (phone, session_path, datetime.now(), datetime.now(), json.dumps(metadata))
                         )
-                    SessionSecurity.encrypt_session(session_path)
+                    SessionSecurity.encrypt_session(session_path, phone)
                     print_success(f"Session created for {me.first_name} {me.last_name or ''} ({me.phone})")
                     logging.info(f"New session created for {phone}")
                     return session_path
@@ -381,21 +399,24 @@ async def list_sessions(country_code: Optional[str] = None) -> Optional[List[str
     table.add_column("File", style="yellow")
     table.add_column("Status", style="green")
     table.add_column("Last Used", style="blue")
+    table.add_column("Username", style="cyan")
     
     with sqlite3.connect(config.DB_PATH) as conn:
         cursor = conn.cursor()
         for i, session in enumerate(sorted(sessions, key=os.path.getmtime, reverse=True), 1):
             session_name = os.path.basename(session).replace('.session', '').replace('.enc', '')
             status = "🔒 Encrypted" if session.endswith('.enc') else "🔓 Normal"
-            cursor.execute("SELECT last_used FROM sessions WHERE phone = ?", (f"+{session_name}",))
-            last_used = cursor.fetchone()
-            last_used_str = last_used[0] if last_used else "Never"
+            cursor.execute("SELECT last_used, metadata FROM sessions WHERE phone = ?", (f"+{session_name}",))
+            result = cursor.fetchone()
+            last_used_str = result[0] if result and result[0] else "Never"
+            username = json.loads(result[1])["username"] if result and result[1] else "N/A"
             table.add_row(
                 str(i),
                 f"+{session_name}",
                 os.path.basename(session),
                 status,
-                last_used_str
+                last_used_str,
+                username
             )
     
     console.print(table)
@@ -414,7 +435,8 @@ async def select_and_login() -> Optional[AdvancedTelegramClient]:
                 return None
             choice = int(choice) - 1
             if 0 <= choice < len(sessions):
-                client = AdvancedTelegramClient(sessions[choice])
+                phone = f"+{os.path.basename(sessions[choice]).replace('.session', '').replace('.enc', '')}"
+                client = AdvancedTelegramClient(sessions[choice], phone)
                 if await client.connect():
                     return client
             print_error(f"Invalid selection. Choose between 1 and {len(sessions)}")
@@ -460,7 +482,7 @@ async def terminate_other_sessions() -> None:
                 await asyncio.sleep(0.5)
         
         print_success(f"Terminated {len(other_sessions)} other sessions")
-        logging.info(f"Terminated {len(other_sessions)} other sessions")
+        logging.info(f"Terminated {len(other_sessions)} other sessions for {client.phone}")
     except Exception as e:
         print_error(f"Failed to terminate sessions: {str(e)}")
         logging.error(f"Failed to terminate sessions: {str(e)}")
@@ -507,7 +529,9 @@ async def update_profile_random_name() -> None:
     try:
         me = await client.client.get_me()
         old_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
-        new_name = f"User_{random.randint(1000, 9999)}"
+        adjectives = ["Cool", "Swift", "Silent", "Mystic"]
+        nouns = ["Ninja", "Wizard", "Ghost", "Phoenix"]
+        new_name = f"{random.choice(adjectives)}{random.choice(nouns)}_{random.randint(100, 999)}"
         await client.safe_execute(
             client.client,
             UpdateProfileRequest,
@@ -515,7 +539,7 @@ async def update_profile_random_name() -> None:
             about=f"Updated by Session Manager on {datetime.now().strftime('%Y-%m-%d')}"
         )
         print_success(f"Profile updated from '{old_name}' to '{new_name}'")
-        logging.info(f"Profile updated for {me.phone}: {new_name}")
+        logging.info(f"Profile updated for {client.phone}: {new_name}")
     except Exception as e:
         print_error(f"Failed to update profile: {str(e)}")
         logging.error(f"Failed to update profile: {str(e)}")
@@ -565,7 +589,7 @@ async def clear_contacts() -> None:
                 await asyncio.sleep(1)
         
         print_success(f"Deleted {len(contacts.contacts)} contacts")
-        logging.info(f"Deleted {len(contacts.contacts)} contacts")
+        logging.info(f"Deleted {len(contacts.contacts)} contacts for {client.phone}")
     except Exception as e:
         print_error(f"Failed to clear contacts: {str(e)}")
         logging.error(f"Failed to clear contacts: {str(e)}")
@@ -618,7 +642,7 @@ async def delete_all_chats_advanced() -> None:
                 await asyncio.sleep(1)
         
         print_success(f"Deleted {len(dialogs.dialogs)} chats/channels")
-        logging.info(f"Deleted {len(dialogs.dialogs)} chats/channels")
+        logging.info(f"Deleted {len(dialogs.dialogs)} chats/channels for {client.phone}")
     except Exception as e:
         print_error(f"Error: {str(e)}")
         logging.error(f"Error deleting chats: {str(e)}")
@@ -666,7 +690,7 @@ async def read_session_otp() -> None:
                     title="Latest OTP",
                     border_style="green"
                 ))
-                logging.info(f"OTP read: {code}")
+                logging.info(f"OTP read: {code} for {client.phone}")
                 return
         print_info("No recent OTP found")
     except Exception as e:
@@ -714,14 +738,14 @@ async def manage_2fa() -> None:
                         salt1=os.urandom(32),
                         salt2=os.urandom(32),
                         g=2,
-                        p=bytes.fromhex('c5')  # Simplified for example
+                        p=bytes.fromhex('c5')
                     ),
                     hint=hint,
                     email=email if email else None
                 )
             )
             print_success("2FA enabled successfully")
-            logging.info("2FA enabled")
+            logging.info(f"2FA enabled for {client.phone}")
         except Exception as e:
             print_error(f"Failed to enable 2FA: {str(e)}")
             logging.error(f"Failed to enable 2FA: {str(e)}")
@@ -743,7 +767,7 @@ async def manage_2fa() -> None:
                 )
             )
             print_success("2FA disabled successfully")
-            logging.info("2FA disabled")
+            logging.info(f"2FA disabled for {client.phone}")
         except Exception as e:
             print_error(f"Failed to disable 2FA: {str(e)}")
             logging.error(f"Failed to disable 2FA: {str(e)}")
@@ -773,7 +797,7 @@ async def manage_2fa() -> None:
                 )
             )
             print_success("2FA password changed successfully")
-            logging.info("2FA password changed")
+            logging.info(f"2FA password changed for {client.phone}")
         except Exception as e:
             print_error(f"Failed to change 2FA password: {str(e)}")
             logging.error(f"Failed to change 2FA password: {str(e)}")
@@ -811,14 +835,14 @@ async def export_sessions() -> None:
     try:
         with sqlite3.connect(config.DB_PATH) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT phone, path, created_at, last_used, encrypted FROM sessions")
+            cursor.execute("SELECT phone, path, created_at, last_used, encrypted, metadata FROM sessions")
             data = cursor.fetchall()
         
         import csv
         with open('sessions_export.csv', 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['Phone', 'Path', 'Created At', 'Last Used', 'Encrypted'])
-            writer.writerows(data)
+            writer.writerow(['Phone', 'Path', 'Created At', 'Last Used', 'Encrypted', 'Metadata'])
+            writer.writerows([(row[0], row[1], row[2], row[3], row[4], json.dumps(json.loads(row[5]) if row[5] else {})) for row in data])
         
         print_success(f"Exported {len(data)} sessions to sessions_export.csv")
         logging.info(f"Exported {len(data)} sessions to CSV")
@@ -838,6 +862,8 @@ async def session_statistics() -> None:
             encrypted = cursor.fetchone()[0]
             cursor.execute("SELECT COUNT(*) FROM sessions WHERE last_used IS NOT NULL")
             active = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM sessions WHERE json_extract(metadata, '$.premium') = 1")
+            premium = cursor.fetchone()[0]
         
         table = Table(title="Session Statistics", box=box.ROUNDED)
         table.add_column("Metric", style="cyan")
@@ -845,10 +871,76 @@ async def session_statistics() -> None:
         table.add_row("Total Sessions", str(total))
         table.add_row("Encrypted Sessions", str(encrypted))
         table.add_row("Active Sessions", str(active))
+        table.add_row("Premium Accounts", str(premium))
         console.print(table)
     except Exception as e:
         print_error(f"Failed to get statistics: {str(e)}")
         logging.error(f"Failed to get statistics: {str(e)}")
+
+async def backup_sessions() -> None:
+    """Backup all session files"""
+    print_header("Backup Sessions")
+    sessions = await list_sessions()
+    if not sessions:
+        return
+    
+    backup_dir = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    os.makedirs(backup_dir, exist_ok=True)
+    
+    try:
+        with Progress() as progress:
+            task = progress.add_task("[green]Backing up sessions...[/green]", total=len(sessions))
+            for session in sessions:
+                dest = os.path.join(backup_dir, os.path.basename(session))
+                with open(session, 'rb') as src, open(dest, 'wb') as dst:
+                    dst.write(src.read())
+                progress.update(task, advance=1)
+        
+        print_success(f"Backed up {len(sessions)} sessions to {backup_dir}")
+        logging.info(f"Backed up {len(sessions)} sessions to {backup_dir}")
+    except Exception as e:
+        print_error(f"Failed to backup sessions: {str(e)}")
+        logging.error(f"Failed to backup sessions: {str(e)}")
+
+async def cleanup_sessions() -> None:
+    """Cleanup unused session files"""
+    print_header("Cleanup Sessions")
+    sessions = glob.glob(os.path.join(config.SESSION_FOLDER, "*.session*"))
+    
+    if not sessions:
+        print_info("No sessions to clean")
+        return
+    
+    with sqlite3.connect(config.DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT path FROM sessions")
+        db_paths = set(row[0] for row in cursor.fetchall())
+    
+    orphaned = [s for s in sessions if s not in db_paths]
+    if not orphaned:
+        print_info("No orphaned sessions found")
+        return
+    
+    table = Table(title=f"Found {len(orphaned)} Orphaned Sessions", box=box.ROUNDED)
+    table.add_column("File", style="yellow")
+    for session in orphaned[:5]:
+        table.add_row(os.path.basename(session))
+    console.print(table)
+    if len(orphaned) > 5:
+        print_info(f"...and {len(orphaned)-5} more")
+    
+    confirm = console.input("[bold red]Delete all orphaned sessions? (y/n): [/bold red]").lower()
+    if confirm != 'y':
+        return
+    
+    with Progress() as progress:
+        task = progress.add_task("[red]Cleaning up...[/red]", total=len(orphaned))
+        for session in orphaned:
+            os.remove(session)
+            progress.update(task, advance=1)
+    
+    print_success(f"Cleaned up {len(orphaned)} orphaned sessions")
+    logging.info(f"Cleaned up {len(orphaned)} orphaned sessions")
 
 def signal_handler(sig, frame):
     """Handle interrupt signals"""
@@ -871,7 +963,9 @@ async def main() -> None:
         "11": ("2FA Management", manage_2fa),
         "12": ("Export Sessions", export_sessions),
         "13": ("Session Statistics", session_statistics),
-        "14": ("Exit", None)
+        "14": ("Backup Sessions", backup_sessions),
+        "15": ("Cleanup Sessions", cleanup_sessions),
+        "16": ("Exit", None)
     }
     
     while True:
@@ -883,17 +977,17 @@ async def main() -> None:
             table.add_row(num, desc)
         console.print(table)
         
-        choice = console.input("[bold cyan]Select option (1-14): [/bold cyan]").strip()
+        choice = console.input("[bold cyan]Select option (1-16): [/bold cyan]").strip()
         if choice in menu_options:
-            if choice == "14":
+            if choice == "16":
                 print_success("Goodbye!")
                 sys.exit(0)
-            elif choice == "2" or choice == "13":
+            elif choice in ("2", "13"):
                 await menu_options[choice][1]()
             else:
                 await menu_options[choice][1]()
         else:
-            print_error("Invalid choice! Select 1-14")
+            print_error("Invalid choice! Select 1-16")
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
@@ -905,5 +999,5 @@ if __name__ == "__main__":
         sys.exit(0)
     except Exception as e:
         print_error(f"Fatal error: {str(e)}")
-        logging.error(f"Fatal error: {str(e)}")
+        logging.error(f"Fatal error: {str(e)}", exc_info=True)
         sys.exit(1)
