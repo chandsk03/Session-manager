@@ -15,6 +15,10 @@ from hashlib import sha256
 import base64
 import logging
 
+# Ensure logs directory exists before logging configuration
+if not os.path.exists('logs'):
+    os.makedirs('logs')
+
 # Telegram Imports
 from telethon import TelegramClient, functions, types
 from telethon.tl.functions.messages import GetDialogsRequest
@@ -58,6 +62,8 @@ from rich.columns import Columns
 # Initialize
 init(autoreset=True)
 console = Console()
+
+# Configure logging after directory creation
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -116,7 +122,7 @@ class SecureConfig:
         if not key:
             key = base64.urlsafe_b64encode(os.urandom(32)).decode()
             console.print(f"[bold yellow]⚠ Generated new encryption key: {key}[/bold yellow]")
-            console.print(f"[bold yellow]⚠ Set this as SESSION_ENCRYPTION_KEY in your environment[/bold yellow]")
+            console.print(f"[bold yellow]⚐ Please set this as SESSION_ENCRYPTION_KEY in your environment[/bold yellow]")
         try:
             return base64.urlsafe_b64decode(key.encode())
         except:
@@ -125,7 +131,7 @@ class SecureConfig:
     
     def _setup_folders(self):
         os.makedirs(self.SESSION_FOLDER, exist_ok=True)
-        os.makedirs('logs', exist_ok=True)
+        # logs directory is already created before logging config
     
     def _setup_database(self):
         with sqlite3.connect(self.DB_PATH) as conn:
