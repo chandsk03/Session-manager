@@ -3,17 +3,14 @@ import os
 import asyncio
 import getpass
 import random
-import glob
 import platform
 import signal
 import sys
 import sqlite3
 import json
-import shutil
 import aiofiles
-import aiohttp
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any, Tuple, AsyncGenerator
+from typing import List, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 from cryptography.fernet import Fernet
 from hashlib import sha256
@@ -23,8 +20,6 @@ import threading
 from importlib.metadata import version
 from pathlib import Path
 from contextlib import asynccontextmanager
-
-# Telegram Imports
 from telethon import TelegramClient, functions, types, __version__ as telethon_version
 from telethon.tl.functions.messages import GetDialogsRequest
 from telethon.tl.functions.account import (
@@ -41,16 +36,14 @@ from telethon.errors import (
     SessionPasswordNeededError,
     FloodWaitError,
     PhoneNumberInvalidError,
-    AuthKeyError,
     RPCError
 )
-
-# UI Imports
+from telethon.sessions import StringSession
 from colorama import Fore, Style, init
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
-from rich.progress import Progress, BarColumn, TimeRemainingColumn
+from rich.progress import Progress
 from rich import box
 from rich.status import Status
 from rich.prompt import Prompt, Confirm
@@ -60,7 +53,7 @@ init(autoreset=True)
 console = Console()
 executor = ThreadPoolExecutor(max_workers=4)
 
-# Configure logging with rotation
+# Configure logging
 if not os.path.exists('logs'):
     os.makedirs('logs')
 logging.basicConfig(
@@ -72,6 +65,10 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+# Adjust terminal handler to show only errors
+for handler in logger.handlers:
+    if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+        handler.setLevel(logging.ERROR)
 
 class Theme:
     PRIMARY = Fore.CYAN
@@ -136,19 +133,18 @@ class SecureConfig:
     def _setup_folders(self):
         self.SESSION_FOLDER.mkdir(exist_ok=True)
         (self.SESSION_FOLDER / "backups").mkdir(exist_ok=True)
+        os.chmod(self.SESSION_FOLDER, 0o755)
+        if self.DB_PATH.exists():
+            os.chmod(self.DB_PATH, 0o664)
     
     def _migrate_database(self):
         if not self.DB_PATH.exists():
             self._create_database()
+            os.chmod(self.DB_PATH, 0o664)
             return
             
-        backup_path = self.DB_PATH.with_name(f"sessions_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db")
-        shutil.copy2(self.DB_PATH, backup_path)
-        console.print(f"[bold blue]ℹ Created database backup: {backup_path}[/bold blue]")
-        logger.info(f"Created database backup: {backup_path}")
-        
         with sqlite3.connect(self.DB_PATH, timeout=20) as conn:
-            conn.execute("PRAGMA busy_timeout = 20000")  # 20 seconds timeout
+            conn.execute("PRAGMA busy_timeout = 20000")
             cursor = conn.cursor()
             cursor.execute("PRAGMA table_info(sessions)")
             columns = {col[1]: col for col in cursor.fetchall()}
@@ -229,7 +225,7 @@ class SessionSecurity:
                 clean_path = session_path[:-4]
                 async with aiofiles.open(clean_path, 'wb') as f:
                     await f.write(decrypted)
-                
+                os.chmod(clean_path, 0o664)
                 async with cls.db_connection() as conn:
                     conn.execute("UPDATE sessions SET encrypted = 0, path = ? WHERE phone = ?", (clean_path, phone))
                 logger.info(f"Session decrypted: {session_path}")
@@ -277,8 +273,9 @@ class AdvancedTelegramClient:
             if not decrypted_path:
                 return False
                 
+            os.chmod(decrypted_path, 0o664)
             client_params = {
-                'session': decrypted_path,
+                'session': StringSession(),  # Use StringSession instead of file-based SQLite
                 'api_id': config.API_ID,
                 'api_hash': config.API_HASH,
                 'device_model': f"SessionManager-{platform.node()}",
@@ -297,6 +294,10 @@ class AdvancedTelegramClient:
                 })
             
             self.client = TelegramClient(**client_params)
+            if os.path.exists(decrypted_path):
+                async with aiofiles.open(decrypted_path, 'r') as f:
+                    session_string = await f.read()
+                self.client.session.load(session_string)
             
             try:
                 with console.status("[bold cyan]Connecting to Telegram...", spinner="dots") as status:
@@ -320,9 +321,17 @@ class AdvancedTelegramClient:
     
     async def disconnect(self):
         if self.client and self.client.is_connected():
-            await self.client.disconnect()
-            console.print("[bold blue]ℹ Client disconnected[/bold blue]")
-            logger.info(f"Client disconnected: {self.session_path}")
+            try:
+                session_string = self.client.session.save()
+                async with aiofiles.open(self.session_path, 'w') as f:
+                    await f.write(session_string)
+                os.chmod(self.session_path, 0o664)
+                await self.client.disconnect()
+                console.print("[bold blue]ℹ Client disconnected[/bold blue]")
+                logger.info(f"Client disconnected: {self.session_path}")
+            except Exception as e:
+                console.print(f"[bold yellow]⚠ Error during disconnect: {str(e)}[/bold yellow]")
+                logger.error(f"Error during disconnect: {str(e)}", exc_info=True)
         self.client = None
     
     async def safe_execute(self, request: Any, *args, **kwargs) -> Any:
@@ -386,7 +395,7 @@ async def create_session() -> Optional[str]:
     
     async with AdvancedTelegramClient(session_path, phone) as client:
         if not await client.connect():
-            async with TelegramClient(session_path, config.API_ID, config.API_HASH) as temp_client:
+            async with TelegramClient(StringSession(), config.API_ID, config.API_HASH) as temp_client:
                 try:
                     print_info(f"Sending code to {phone}...")
                     await temp_client.send_code_request(phone)
@@ -409,6 +418,10 @@ async def create_session() -> Optional[str]:
                         "premium": me.premium,
                         "language": me.lang_code
                     }
+                    session_string = temp_client.session.save()
+                    async with aiofiles.open(session_path, 'w') as f:
+                        await f.write(session_string)
+                    os.chmod(session_path, 0o664)
                     async with SessionSecurity.db_connection() as conn:
                         conn.execute(
                             "INSERT OR REPLACE INTO sessions (phone, path, created_at, last_used, metadata, session_hash) VALUES (?, ?, ?, ?, ?, ?)",
@@ -418,8 +431,11 @@ async def create_session() -> Optional[str]:
                     print_success(f"Session created for {me.first_name} {me.last_name or ''} ({me.phone})")
                     logger.info(f"New session created for {phone}")
                     return session_path
-                except Exception as e:
-                    print_error(f"Failed to create session: {str(e)}")
+                except RPCError as e:
+                    if "ResendCodeRequest" in str(e):
+                        print_warning("Telegram verification limit reached. Please wait and try again later.")
+                    else:
+                        print_error(f"Failed to create session: {str(e)}")
                     if os.path.exists(session_path):
                         os.remove(session_path)
                     return None
