@@ -9,18 +9,27 @@ import sys
 import sqlite3
 import json
 import aiofiles
+import csv
+import shutil
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 import logging
 from logging.handlers import RotatingFileHandler
-import threading
 from importlib.metadata import version
 from pathlib import Path
 from contextlib import asynccontextmanager
 from telethon import TelegramClient, functions, types, __version__ as telethon_version
-from telethon.tl.functions.messages import GetDialogsRequest
+from telethon.errors import (
+    SessionPasswordNeededError,
+    FloodWaitError,
+    PhoneNumberInvalidError,
+    PhoneCodeInvalidError,
+    RPCError,
+    TwoFaRequiredError
+)
+from telethon.sessions import StringSession
 from telethon.tl.functions.account import (
     GetAuthorizationsRequest,
     ResetAuthorizationRequest,
@@ -31,122 +40,81 @@ from telethon.tl.functions.account import (
 )
 from telethon.tl.functions.contacts import DeleteContactsRequest, GetContactsRequest
 from telethon.tl.functions.channels import LeaveChannelRequest
-from telethon.errors import (
-    SessionPasswordNeededError,
-    FloodWaitError,
-    PhoneNumberInvalidError,
-    PhoneCodeInvalidError,
-    RPCError
-)
-from telethon.sessions import StringSession
-from colorama import Fore, Style, init
+from telethon.tl.functions.messages import GetDialogsRequest
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich import box
-from rich.status import Status
 from rich.prompt import Prompt, Confirm
 from rich.layout import Layout
 from rich.live import Live
 
 # Initialize
-init(autoreset=True)
 console = Console()
 executor = ThreadPoolExecutor(max_workers=4)
 
-# Configure logging
+# Configure logging (file only)
 if not os.path.exists('logs'):
     os.makedirs('logs')
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s - [%(filename)s:%(lineno)d] - Thread: %(threadName)s',
-    handlers=[
-        RotatingFileHandler('logs/session_manager.log', maxBytes=10*1024*1024, backupCount=10),
-        logging.StreamHandler()
-    ]
+    handlers=[RotatingFileHandler('logs/session_manager.log', maxBytes=10*1024*1024, backupCount=10)]
 )
 logger = logging.getLogger(__name__)
-for handler in logger.handlers:
-    if isinstance(handler, logging.StreamHandler) and not isinstance(handler, RotatingFileHandler):
-        handler.setLevel(logging.ERROR)
-
-class Theme:
-    PRIMARY = Fore.CYAN
-    SUCCESS = Fore.GREEN
-    ERROR = Fore.RED
-    WARNING = Fore.YELLOW
-    INFO = Fore.BLUE
-    MENU = Fore.MAGENTA
-    RESET = Style.RESET_ALL
-    BOLD = Style.BRIGHT
 
 class SecureConfig:
     _instance = None
-    _lock = threading.Lock()
+    _lock = asyncio.Lock()
     
     def __new__(cls):
-        with cls._lock:
-            if cls._instance is None:
-                cls._instance = super(SecureConfig, cls).__new__(cls)
-                cls._instance._initialize()
+        if cls._instance is None:
+            cls._instance = super(SecureConfig, cls).__new__(cls)
+            cls._instance._initialize()
         return cls._instance
     
     def _initialize(self):
-        self.API_ID = self._get_env_int("TELEGRAM_API_ID", "23077946")
-        self.API_HASH = self._get_env("TELEGRAM_API_HASH", "b6c2b715121435d4aa285c1fb2bc2220")
+        self.API_ID = int(os.getenv("TELEGRAM_API_ID", "23077946"))
+        self.API_HASH = os.getenv("TELEGRAM_API_HASH", "b6c2b715121435d4aa285c1fb2bc2220")
         self.SESSION_FOLDER = Path("sessions")
-        self.MAX_RETRIES = self._get_env_int("MAX_RETRIES", "5")
-        self.RETRY_DELAY = self._get_env_int("RETRY_DELAY", "5")
         self.DB_PATH = Path("sessions.db")
-        self.TELETHON_VERSION = version('telethon')
-        self.BATCH_SIZE = self._get_env_int("BATCH_SIZE", "100")
-        self.CONCURRENT_CONNECTIONS = self._get_env_int("CONCURRENT_CONNECTIONS", "4")
+        self.MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
+        self.RETRY_DELAY = int(os.getenv("RETRY_DELAY", "5"))
+        self.BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
+        self.CONCURRENT_CONNECTIONS = int(os.getenv("CONCURRENT_CONNECTIONS", "4"))
+        self.TELETHON_VERSION = telethon_version
         self._setup_folders()
         self._migrate_database()
-        
-    def _get_env(self, var: str, default: str) -> str:
-        return os.getenv(var, default).strip() if os.getenv(var) else default
-    
-    def _get_env_int(self, var: str, default: str) -> int:
-        try:
-            return int(self._get_env(var, default))
-        except ValueError:
-            console.print(f"[bold red]✗ Invalid value for {var}, using default: {default}[/bold red]")
-            logger.warning(f"Invalid value for {var}, using default: {default}")
-            return int(default)
     
     def _setup_folders(self):
         self.SESSION_FOLDER.mkdir(exist_ok=True)
         (self.SESSION_FOLDER / "backups").mkdir(exist_ok=True)
-        os.chmod(self.SESSION_FOLDER, 0o755)
+        os.chmod(self.SESSION_FOLDER, 0o700)
         if self.DB_PATH.exists():
-            os.chmod(self.DB_PATH, 0o664)
+            os.chmod(self.DB_PATH, 0o600)
     
     def _migrate_database(self):
         if not self.DB_PATH.exists():
             self._create_database()
-            os.chmod(self.DB_PATH, 0o664)
+            os.chmod(self.DB_PATH, 0o600)
             return
-            
         with sqlite3.connect(self.DB_PATH, timeout=20) as conn:
             conn.execute("PRAGMA busy_timeout = 20000")
             cursor = conn.cursor()
             cursor.execute("PRAGMA table_info(sessions)")
-            columns = {col[1]: col for col in cursor.fetchall()}
-            
+            columns = {col[1] for col in cursor.fetchall()}
             migrations = [
-                ("metadata", "TEXT", "ALTER TABLE sessions ADD COLUMN metadata TEXT"),
-                ("session_hash", "TEXT", "ALTER TABLE sessions ADD COLUMN session_hash TEXT"),
-                ("status", "TEXT", "ALTER TABLE sessions ADD COLUMN status TEXT DEFAULT 'active'")
+                ("metadata", "ALTER TABLE sessions ADD COLUMN metadata TEXT"),
+                ("session_hash", "ALTER TABLE sessions ADD COLUMN session_hash TEXT"),
+                ("status", "ALTER TABLE sessions ADD COLUMN status TEXT DEFAULT 'active'"),
+                ("notes", "ALTER TABLE sessions ADD COLUMN notes TEXT")
             ]
-            
-            for col_name, col_type, sql in migrations:
+            for col_name, sql in migrations:
                 if col_name not in columns:
-                    console.print(f"[bold yellow]⚠ Migrating database to add {col_name} column[/bold yellow]")
                     cursor.execute(sql)
-                    conn.commit()
                     logger.info(f"Database migrated: added {col_name} column")
+            conn.commit()
 
     def _create_database(self):
         with sqlite3.connect(self.DB_PATH, timeout=20) as conn:
@@ -154,17 +122,18 @@ class SecureConfig:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
                     phone TEXT PRIMARY KEY,
-                    path TEXT,
+                    path TEXT UNIQUE,
                     created_at TEXT,
                     last_used TEXT,
                     metadata TEXT,
                     session_hash TEXT,
-                    status TEXT DEFAULT 'active'
+                    status TEXT DEFAULT 'active',
+                    notes TEXT
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_phone ON sessions(phone)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON sessions(status)")
-            logger.info("Created new sessions database with indexes")
+            logger.info("Created new sessions database")
 
 config = SecureConfig()
 
@@ -184,7 +153,7 @@ class AdvancedTelegramClient:
         self.phone = phone
         self.client = None
         self._me = None
-        self._semaphore = asyncio.Semaphore(config.CONCURRENT_CONNECTIONS)
+        self._connected = False
         
     async def __aenter__(self):
         await self.connect()
@@ -194,291 +163,236 @@ class AdvancedTelegramClient:
         await self.disconnect()
         
     async def connect(self) -> bool:
-        async with self._semaphore:
-            client_params = {
-                'session': StringSession(),
-                'api_id': config.API_ID,
-                'api_hash': config.API_HASH,
-                'device_model': f"SessionManager-{platform.node()}",
-                'system_version': platform.platform(),
-                'app_version': "5.1",
-                'lang_code': "en",
-                'system_lang_code': "en-US",
-                'connection_retries': config.MAX_RETRIES,
-                'retry_delay': config.RETRY_DELAY,
-                'auto_reconnect': True,
-                'flood_sleep_threshold': 60
-            }
-            
-            self.client = TelegramClient(**client_params)
-            if os.path.exists(self.session_path):
-                try:
-                    os.chmod(self.session_path, 0o664)
-                    async with aiofiles.open(self.session_path, 'r') as f:
-                        session_string = await f.read()
-                    self.client.session.load(session_string)
-                except Exception as e:
-                    console.print(f"[bold yellow]⚠ Failed to load session file: {str(e)}[/bold yellow]")
-                    logger.warning(f"Failed to load session {self.session_path}: {str(e)}")
-            
-            for attempt in range(config.MAX_RETRIES):
-                try:
-                    with console.status("[bold cyan]Connecting to Telegram...", spinner="dots") as status:
-                        await self.client.connect()
-                        if not await self.client.is_user_authorized():
-                            logger.info(f"Session not authorized for {self.phone}")
-                            return False
-                        self._me = await self.client.get_me()
-                        console.print(f"[bold green]✓ Connected as {self._me.first_name} (ID: {self._me.id})[/bold green]")
-                        async with db_connection() as conn:
-                            conn.execute(
-                                "UPDATE sessions SET last_used = ?, session_hash = ? WHERE phone = ?",
-                                (datetime.now(timezone.utc).isoformat(), self._generate_session_hash(), self.phone)
-                            )
-                        logger.info(f"Connected to session: {self.phone}")
-                        return True
-                except (TimeoutError, ConnectionError) as e:
-                    console.print(f"[bold yellow]⚠ Connection attempt {attempt+1}/{config.MAX_RETRIES} failed: {str(e)}[/bold yellow]")
-                    logger.warning(f"Connection attempt {attempt+1} failed: {str(e)}")
-                    if attempt < config.MAX_RETRIES - 1:
-                        await asyncio.sleep(config.RETRY_DELAY * (2 ** attempt))
-                except Exception as e:
-                    console.print(f"[bold red]✗ Connection failed: {str(e)}[/bold red]")
-                    logger.error(f"Connection failed for {self.session_path}: {str(e)}", exc_info=True)
-                    return False
-            console.print(f"[bold red]✗ Failed to connect after {config.MAX_RETRIES} attempts[/bold red]")
-            return False
+        if self._connected:
+            return True
+        self.client = TelegramClient(
+            StringSession(),
+            config.API_ID,
+            config.API_HASH,
+            device_model=f"SessionManager-{platform.node()}",
+            system_version=platform.system(),
+            app_version="5.1",
+            connection_retries=config.MAX_RETRIES,
+            retry_delay=config.RETRY_DELAY
+        )
+        if os.path.exists(self.session_path):
+            try:
+                async with aiofiles.open(self.session_path, 'rb') as f:
+                    session_data = await f.read()
+                self.client.session.load(session_data.decode('utf-8', errors='replace'))
+            except Exception as e:
+                console.print(f"[yellow]⚠ Failed to load session file: {e}[/yellow]")
+                logger.warning(f"Failed to load {self.session_path}: {e}")
+        
+        for attempt in range(config.MAX_RETRIES):
+            try:
+                with console.status("[cyan]Connecting to Telegram...", spinner="dots"):
+                    await self.client.connect()
+                    if not await self.client.is_user_authorized():
+                        console.print(f"[yellow]⚠ Session {self.phone} not authorized[/yellow]")
+                        return False
+                    self._me = await self.client.get_me()
+                    self._connected = True
+                    async with db_connection() as conn:
+                        conn.execute(
+                            "UPDATE sessions SET last_used = ?, session_hash = ? WHERE phone = ?",
+                            (datetime.now(timezone.utc).isoformat(), self._generate_session_hash(), self.phone)
+                        )
+                    console.print(f"[green]✓ Connected as {self._me.first_name} (ID: {self._me.id})[/green]")
+                    logger.info(f"Connected to {self.phone}")
+                    return True
+            except Exception as e:
+                console.print(f"[red]✗ Attempt {attempt + 1} failed: {e}[/red]")
+                logger.error(f"Connection attempt {attempt + 1} failed for {self.phone}: {e}")
+                if attempt < config.MAX_RETRIES - 1:
+                    await asyncio.sleep(config.RETRY_DELAY * (2 ** attempt))
+        console.print(f"[red]✗ Failed after {config.MAX_RETRIES} attempts[/red]")
+        return False
     
     async def disconnect(self):
-        if self.client and self.client.is_connected():
+        if self.client and self._connected:
             try:
                 session_string = self.client.session.save()
                 async with aiofiles.open(self.session_path, 'w') as f:
                     await f.write(session_string)
-                os.chmod(self.session_path, 0o664)
+                os.chmod(self.session_path, 0o600)
                 await self.client.disconnect()
-                console.print("[bold blue]ℹ Client disconnected[/bold blue]")
-                logger.info(f"Client disconnected: {self.session_path}")
+                self._connected = False
+                console.print("[blue]ℹ Client disconnected[/blue]")
+                logger.info(f"Disconnected {self.phone}")
             except Exception as e:
-                console.print(f"[bold yellow]⚠ Error during disconnect: {str(e)}[/bold yellow]")
-                logger.error(f"Error during disconnect: {str(e)}", exc_info=True)
+                console.print(f"[red]✗ Disconnect failed: {e}[/red]")
+                logger.error(f"Disconnect failed for {self.phone}: {e}")
         self.client = None
     
     async def safe_execute(self, request: Any, *args, **kwargs) -> Any:
-        async with self._semaphore:
-            for attempt in range(config.MAX_RETRIES):
-                try:
-                    if callable(request):
-                        return await request(*args, **kwargs)
-                    return await self.client(request)
-                except FloodWaitError as e:
-                    wait = min(e.seconds, 3600)
-                    console.print(f"[bold yellow]⚠ Flood wait {wait}s (Attempt {attempt+1}/{config.MAX_RETRIES})[/bold yellow]")
-                    await asyncio.sleep(wait)
-                except Exception as e:
-                    console.print(f"[bold red]✗ Attempt {attempt+1} failed: {str(e)}[/bold red]")
-                    if attempt == config.MAX_RETRIES - 1:
-                        raise
-                    await asyncio.sleep(config.RETRY_DELAY * (2 ** attempt))
-            return None
-
+        if not self._connected:
+            await self.connect()
+        for attempt in range(config.MAX_RETRIES):
+            try:
+                if callable(request):
+                    return await request(*args, **kwargs)
+                return await self.client(request)
+            except FloodWaitError as e:
+                wait = min(e.seconds, 3600)
+                console.print(f"[yellow]⚠ Flood wait: {wait}s[/yellow]")
+                await asyncio.sleep(wait)
+            except Exception as e:
+                if attempt == config.MAX_RETRIES - 1:
+                    console.print(f"[red]✗ Operation failed: {e}[/red]")
+                    logger.error(f"Operation failed for {self.phone}: {e}")
+                    raise
+                await asyncio.sleep(config.RETRY_DELAY * (2 ** attempt))
+        return None
+    
     def _generate_session_hash(self) -> str:
         return sha256(f"{self.phone}{datetime.now().isoformat()}".encode()).hexdigest()[:16]
 
 def print_header(title: str) -> None:
-    console.print(Panel.fit(
+    console.print(Panel(
         f"[bold cyan]{title}[/bold cyan]",
-        style="bold cyan",
         border_style="blue",
-        subtitle=f"Advanced Session Manager v5.1 | Telethon {telethon_version}",
-        subtitle_align="right"
+        subtitle=f"v5.1 | Telethon {telethon_version}",
+        padding=(0, 2)
     ))
 
-def print_success(message: str) -> None:
-    console.print(f"[bold green]✓ {message}[/bold green]")
-
-def print_error(message: str) -> None:
-    console.print(f"[bold red]✗ {message}[/bold red]")
-
-def print_warning(message: str) -> None:
-    console.print(f"[bold yellow]⚠ {message}[/bold yellow]")
-
-def print_info(message: str) -> None:
-    console.print(f"[bold blue]ℹ {message}[/bold blue]")
+def print_message(style: str, symbol: str, message: str):
+    console.print(f"[{style}]{symbol} {message}[/{style}]")
 
 def validate_phone(phone: str) -> bool:
-    if not phone.startswith('+') or len(phone) < 11 or len(phone) > 15:
-        return False
-    digits = phone[1:].replace(' ', '')
-    return digits.isdigit()
+    phone = phone.strip()
+    return phone.startswith('+') and 11 <= len(phone) <= 15 and phone[1:].isdigit()
 
 async def create_session() -> Optional[str]:
     print_header("Create New Session")
-    phone = Prompt.ask("[bold cyan]Enter phone number (e.g., +8801720197116)[/bold cyan]", default="+")
-    if not validate_phone(phone):
-        print_error("Invalid phone number format. Use full international format (e.g., +8801720197116)")
-        return None
+    while True:
+        phone = Prompt.ask("[cyan]Enter phone number (e.g., +8801720197116, 'q' to quit)[/cyan]", default="+")
+        if phone.lower() == 'q':
+            return None
+        if not validate_phone(phone):
+            print_message("red", "✗", "Invalid format. Use + followed by 10-14 digits")
+            continue
+        break
     
     session_path = str(config.SESSION_FOLDER / f"{phone[1:]}.session")
     if os.path.exists(session_path):
-        print_warning(f"Session already exists for {phone}")
-        return session_path
+        print_message("yellow", "⚠", f"Session exists for {phone}")
+        if not Confirm.ask("[yellow]Overwrite existing session?[/yellow]"):
+            return session_path
     
-    async with TelegramClient(StringSession(), config.API_ID, config.API_HASH) as temp_client:
+    async with TelegramClient(StringSession(), config.API_ID, config.API_HASH) as client:
         try:
-            with console.status("[bold cyan]Connecting to Telegram...", spinner="dots"):
-                await temp_client.connect()
-            print_info(f"Sending code to {phone}...")
-            sent_code = await temp_client.send_code_request(phone)
-            phone_code_hash = sent_code.phone_code_hash
-            
-            for code_attempt in range(3):
-                code = Prompt.ask("[bold yellow]Enter code (or 'q' to quit)[/bold yellow]", default="q")
+            with console.status("[cyan]Connecting to Telegram...", spinner="dots"):
+                await client.connect()
+            print_message("blue", "ℹ", f"Sending code to {phone}")
+            sent_code = await client.send_code_request(phone)
+            for attempt in range(3):
+                code = Prompt.ask("[yellow]Enter code ('q' to quit)[/yellow]", default="q")
                 if code.lower() == 'q':
                     return None
                 try:
-                    await temp_client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+                    await client.sign_in(phone, code, phone_code_hash=sent_code.phone_code_hash)
                     break
                 except PhoneCodeInvalidError:
-                    print_warning("Invalid code. Please try again.")
-                    if code_attempt == 2:
-                        print_error("Too many invalid code attempts.")
+                    print_message("yellow", "⚠", "Invalid code")
+                    if attempt == 2:
+                        print_message("red", "✗", "Too many invalid attempts")
                         return None
                 except SessionPasswordNeededError:
-                    password = getpass.getpass("[bold red]Enter 2FA password: [/bold red]")
-                    await temp_client.sign_in(password=password)
+                    password = getpass.getpass("Enter 2FA password: ")
+                    await client.sign_in(password=password)
                     break
             
-            me = await temp_client.get_me()
+            me = await client.get_me()
             metadata = {
-                "username": me.username,
-                "first_name": me.first_name,
-                "last_name": me.last_name,
+                "username": me.username or "",
+                "first_name": me.first_name or "",
+                "last_name": me.last_name or "",
                 "premium": me.premium,
-                "language": me.lang_code
+                "id": str(me.id)
             }
-            session_string = temp_client.session.save()
+            session_string = client.session.save()
             async with aiofiles.open(session_path, 'w') as f:
                 await f.write(session_string)
-            os.chmod(session_path, 0o664)
+            os.chmod(session_path, 0o600)
             async with db_connection() as conn:
                 conn.execute(
                     "INSERT OR REPLACE INTO sessions (phone, path, created_at, last_used, metadata, session_hash) VALUES (?, ?, ?, ?, ?, ?)",
-                    (phone, session_path, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat(), json.dumps(metadata), sha256(f"{phone}{datetime.now().isoformat()}".encode()).hexdigest()[:16])
+                    (phone, session_path, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat(), json.dumps(metadata), sha256(phone.encode()).hexdigest()[:16])
                 )
-            print_success(f"Session created for {me.first_name} {me.last_name or ''} ({me.phone})")
-            logger.info(f"New session created for {phone}")
+            print_message("green", "✓", f"Session created for {me.first_name} {me.last_name or ''} ({phone})")
+            logger.info(f"Session created for {phone}")
             return session_path
-            
-        except PhoneNumberInvalidError as e:
-            print_error(f"Invalid phone number: {str(e)}")
+        except PhoneNumberInvalidError:
+            print_message("red", "✗", "Invalid phone number")
             return None
         except FloodWaitError as e:
-            wait = min(e.seconds, 3600)
-            print_warning(f"Flood wait required: {wait}s. Please try again later.")
+            print_message("yellow", "⚠", f"Flood wait: {min(e.seconds, 3600)}s")
             return None
         except RPCError as e:
-            if "ResendCodeRequest" in str(e):
-                print_warning("Telegram verification limit reached. Please wait and try again later.")
-            else:
-                print_error(f"Failed to create session: {str(e)}")
+            print_message("red", "✗", f"Telegram error: {e}")
             return None
         except Exception as e:
-            print_error(f"Failed to create session: {str(e)}")
-            logger.error(f"Failed to create session for {phone}: {str(e)}", exc_info=True)
+            print_message("red", "✗", f"Unexpected error: {e}")
+            logger.error(f"Failed to create session for {phone}: {e}")
             return None
-        finally:
-            if temp_client.is_connected():
-                await temp_client.disconnect()
 
 async def list_sessions(status_filter: str = "active") -> Optional[List[str]]:
-    # Normalize session files (remove '+' prefix if present)
-    sessions = []
-    for p in config.SESSION_FOLDER.glob("*.session"):
-        filename = p.name
-        if filename.startswith('+'):
-            normalized_path = str(config.SESSION_FOLDER / filename[1:])
-            if not os.path.exists(normalized_path):
-                os.rename(str(p), normalized_path)
-                logger.info(f"Normalized session file: {filename} -> {filename[1:]}")
-            sessions.append(normalized_path)
-        else:
-            sessions.append(str(p))
-    
+    print_header("List Sessions")
+    sessions = [str(p) for p in config.SESSION_FOLDER.glob("*.session")]
     if not sessions:
-        print_warning("No saved sessions found")
+        print_message("yellow", "⚠", "No sessions found")
         return None
     
-    # Auto-detect and validate manually added sessions
-    async with db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT phone, path FROM sessions")
-        known_sessions = {row[1]: row[0] for row in cursor.fetchall()}
-        
-        for session in sessions:
-            if session not in known_sessions:
-                phone = f"+{os.path.basename(session).replace('.session', '')}"
-                if not validate_phone(phone):
-                    print_warning(f"Invalid phone format in session file: {os.path.basename(session)}")
-                    continue
-                async with AdvancedTelegramClient(session, phone) as client:
-                    if await client.connect():
-                        me = await client._me
-                        metadata = {
-                            "username": me.username,
-                            "first_name": me.first_name,
-                            "last_name": me.last_name,
-                            "premium": me.premium,
-                            "language": me.lang_code
-                        }
-                        cursor.execute(
-                            "INSERT OR REPLACE INTO sessions (phone, path, created_at, last_used, metadata, session_hash) VALUES (?, ?, ?, ?, ?, ?)",
-                            (phone, session, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat(), json.dumps(metadata), client._generate_session_hash())
-                        )
-                        conn.commit()
-                        print_success(f"Detected and added manual session: {phone} ({me.first_name})")
-                        logger.info(f"Manually detected and added session: {phone}")
-                    else:
-                        print_warning(f"Failed to validate manual session: {phone}")
-                        logger.warning(f"Failed to validate manual session: {phone}")
-    
-    table = Table(
-        title=f"[bold magenta]Available Sessions ({status_filter})[/bold magenta]",
-        box=box.ROUNDED,
-        header_style="bold magenta",
-        border_style="blue",
-        show_lines=True
-    )
-    table.add_column("#", style="cyan", justify="right", width=3)
-    table.add_column("Phone", style="magenta", width=15)
-    table.add_column("File", style="yellow", width=20)
-    table.add_column("Last Used", style="blue", width=20)
-    table.add_column("Username", style="cyan", width=15)
-    table.add_column("Hash", style="white", width=8)
-    table.add_column("Status", style="green", width=10)
-    
-    filtered_sessions = []
     async with db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT phone, path, last_used, metadata, session_hash, status FROM sessions WHERE status = ?", (status_filter,))
         db_sessions = {row[0]: row for row in cursor.fetchall()}
         
-        for i, session in enumerate(sorted(sessions, key=os.path.getmtime, reverse=True), 1):
-            session_name = os.path.basename(session).replace('.session', '')
-            phone = f"+{session_name}"
-            if phone in db_sessions:
-                row = db_sessions[phone]
-                last_used = row[2][:19] if row[2] else "Never"
-                metadata = json.loads(row[3]) if row[3] else {}
-                username = metadata.get("username", "N/A")
-                session_hash = row[4][:8] if row[4] else "N/A"
-                status = "[green]Active[/green]" if row[5] == "active" else "[red]Inactive[/red]"
-                table.add_row(str(i), phone, os.path.basename(session), last_used, username, session_hash, status)
-                filtered_sessions.append(session)
-            else:
-                # Show unverified sessions as pending
-                table.add_row(str(i), phone, os.path.basename(session), "Pending", "N/A", "N/A", "[yellow]Unverified[/yellow]")
-                filtered_sessions.append(session)
+        for session in sessions[:]:
+            phone = f"+{os.path.basename(session).replace('.session', '')}"
+            if phone not in db_sessions and validate_phone(phone):
+                async with AdvancedTelegramClient(session, phone) as client:
+                    if await client.connect():
+                        me = client._me
+                        metadata = {
+                            "username": me.username or "",
+                            "first_name": me.first_name or "",
+                            "last_name": me.last_name or "",
+                            "premium": me.premium,
+                            "id": str(me.id)
+                        }
+                        cursor.execute(
+                            "INSERT OR IGNORE INTO sessions (phone, path, created_at, last_used, metadata, session_hash) VALUES (?, ?, ?, ?, ?, ?)",
+                            (phone, session, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat(), json.dumps(metadata), client._generate_session_hash())
+                        )
+                        conn.commit()
+                        print_message("green", "✓", f"Added manual session: {phone}")
+                        logger.info(f"Added manual session: {phone}")
+                    else:
+                        print_message("yellow", "⚠", f"Unverified session: {phone}")
+    
+    table = Table(title=f"[magenta]Sessions ({status_filter})[/magenta]", box=box.ROUNDED, border_style="blue")
+    table.add_column("#", style="cyan", width=3)
+    table.add_column("Phone", style="magenta", width=15)
+    table.add_column("Last Used", style="blue", width=20)
+    table.add_column("Username", style="cyan", width=15)
+    table.add_column("Status", style="green", width=10)
+    table.add_column("Hash", style="white", width=8)
+    
+    filtered_sessions = []
+    for i, session in enumerate(sorted(sessions, key=os.path.getmtime, reverse=True), 1):
+        phone = f"+{os.path.basename(session).replace('.session', '')}"
+        if phone in db_sessions:
+            row = db_sessions[phone]
+            last_used = row[2][:19] if row[2] else "Never"
+            metadata = json.loads(row[3])
+            status = "[green]Active[/green]" if row[5] == "active" else "[red]Inactive[/red]"
+            table.add_row(str(i), phone, last_used, metadata.get("username", "N/A"), status, row[4][:8] if row[4] else "N/A")
+            filtered_sessions.append(session)
+        else:
+            table.add_row(str(i), phone, "Pending", "N/A", "[yellow]Unverified[/yellow]", "N/A")
+            filtered_sessions.append(session)
     
     console.print(table)
     return filtered_sessions
@@ -487,40 +401,37 @@ async def select_and_login() -> Optional['AdvancedTelegramClient']:
     sessions = await list_sessions()
     if not sessions:
         return None
-    
     while True:
-        choice = Prompt.ask(f"[bold cyan]Select session (1-{len(sessions)} or 'q' to quit)[/bold cyan]", default="q")
+        choice = Prompt.ask(f"[cyan]Select session (1-{len(sessions)}, 'q' to quit)[/cyan]", default="q")
         if choice.lower() == 'q':
             return None
         try:
-            choice = int(choice) - 1
-            if 0 <= choice < len(sessions):
-                phone = f"+{os.path.basename(sessions[choice]).replace('.session', '')}"
-                client = AdvancedTelegramClient(sessions[choice], phone)
+            idx = int(choice) - 1
+            if 0 <= idx < len(sessions):
+                phone = f"+{os.path.basename(sessions[idx]).replace('.session', '')}"
+                client = AdvancedTelegramClient(sessions[idx], phone)
                 if await client.connect():
                     return client
-                else:
-                    print_error(f"Failed to connect to session {phone}")
+                print_message("red", "✗", f"Failed to connect to {phone}")
             else:
-                print_error(f"Invalid selection. Choose between 1 and {len(sessions)}")
+                print_message("red", "✗", f"Invalid choice (1-{len(sessions)})")
         except ValueError:
-            print_error("Please enter a valid number or 'q'")
+            print_message("red", "✗", "Invalid input")
+        return None
 
-async def terminate_other_sessions() -> None:
+async def terminate_other_sessions():
     print_header("Terminate Other Sessions")
     client = await select_and_login()
     if not client:
         return
-    
     try:
         auths = await client.safe_execute(GetAuthorizationsRequest())
         other_sessions = [a for a in auths.authorizations if not a.current]
-        
         if not other_sessions:
-            print_info("No other active sessions found")
+            print_message("blue", "ℹ", "No other active sessions found")
             return
-            
-        table = Table(title="Other Sessions", box=box.ROUNDED, header_style="bold red", border_style="red")
+        
+        table = Table(title="Other Sessions", box=box.ROUNDED, border_style="red")
         table.add_column("Device", style="cyan")
         table.add_column("IP", style="magenta")
         table.add_column("Location", style="yellow")
@@ -529,173 +440,148 @@ async def terminate_other_sessions() -> None:
             table.add_row(auth.device_model, auth.ip, auth.country, auth.date_active.strftime('%Y-%m-%d %H:%M:%S'))
         console.print(table)
         
-        if not Confirm.ask("[bold red]Confirm termination of ALL other sessions?[/bold red]"):
+        if not Confirm.ask("[red]Terminate all other sessions?[/red]"):
             return
-            
-        async with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
-            task = progress.add_task("[red]Terminating sessions...", total=len(other_sessions))
-            tasks = [client.safe_execute(ResetAuthorizationRequest, hash=auth.hash) for auth in other_sessions]
-            await asyncio.gather(*tasks)
-            progress.update(task, completed=len(other_sessions))
         
-        print_success(f"Terminated {len(other_sessions)} other sessions")
-        logger.info(f"Terminated {len(other_sessions)} other sessions for {client.phone}")
+        async with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+            task = progress.add_task("[red]Terminating...", total=len(other_sessions))
+            for auth in other_sessions:
+                await client.safe_execute(ResetAuthorizationRequest, hash=auth.hash)
+                progress.update(task, advance=1)
+        print_message("green", "✓", f"Terminated {len(other_sessions)} sessions")
+        logger.info(f"Terminated {len(other_sessions)} sessions for {client.phone}")
     except Exception as e:
-        print_error(f"Failed to terminate sessions: {str(e)}")
-        logger.error(f"Failed to terminate sessions: {str(e)}", exc_info=True)
+        print_message("red", "✗", f"Failed: {e}")
+        logger.error(f"Failed to terminate sessions for {client.phone}: {e}")
 
-async def show_active_sessions() -> None:
+async def show_active_sessions():
     print_header("Active Sessions")
     client = await select_and_login()
     if not client:
         return
-    
     try:
         auths = await client.safe_execute(GetAuthorizationsRequest())
-        table = Table(title=f"Active Sessions ({len(auths.authorizations)})", box=box.ROUNDED, header_style="bold cyan", border_style="cyan")
+        table = Table(title=f"Active Sessions ({len(auths.authorizations)})", box=box.ROUNDED, border_style="cyan")
         table.add_column("Status", style="bold")
         table.add_column("Device", style="cyan")
         table.add_column("IP", style="magenta")
-        table.add_column("Location", style="yellow")
         table.add_column("Last Active", style="green")
-        table.add_column("App Version", style="white")
-        
         for auth in auths.authorizations:
             status = "[green]Current[/green]" if auth.current else "[red]Other[/red]"
-            table.add_row(
-                status, 
-                auth.device_model, 
-                auth.ip, 
-                auth.country, 
-                auth.date_active.strftime('%Y-%m-%d %H:%M:%S'),
-                auth.app_version
-            )
+            table.add_row(status, auth.device_model, auth.ip, auth.date_active.strftime('%Y-%m-%d %H:%M:%S'))
         console.print(table)
     except Exception as e:
-        print_error(f"Error fetching sessions: {str(e)}")
-        logger.error(f"Error fetching sessions: {str(e)}", exc_info=True)
+        print_message("red", "✗", f"Error: {e}")
+        logger.error(f"Error fetching sessions for {client.phone}: {e}")
 
-async def update_profile_random_name() -> None:
+async def update_profile_random_name():
     print_header("Update Profile")
     client = await select_and_login()
     if not client:
         return
-    
     try:
         me = await client.client.get_me()
         old_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
         adjectives = ["Cyber", "Quantum", "Neon", "Stealth", "Vortex"]
         nouns = ["Hacker", "Sentinel", "Phantom", "Rogue", "Titan"]
         new_name = f"{random.choice(adjectives)}{random.choice(nouns)}{random.randint(1000, 9999)}"
-        about = Prompt.ask("[bold cyan]Enter new about text (optional)[/bold cyan]", default=f"Managed by Session Manager {datetime.now().strftime('%Y-%m-%d')}")
-        await client.safe_execute(UpdateProfileRequest, first_name=new_name, about=about)
-        print_success(f"Profile updated from '{old_name}' to '{new_name}'")
+        about = Prompt.ask("[cyan]New about text (Enter to skip)[/cyan]", default="")
+        await client.safe_execute(UpdateProfileRequest, first_name=new_name, about=about or None)
+        print_message("green", "✓", f"Updated from '{old_name}' to '{new_name}'")
         logger.info(f"Profile updated for {client.phone}: {new_name}")
     except Exception as e:
-        print_error(f"Failed to update profile: {str(e)}")
-        logger.error(f"Failed to update profile: {str(e)}", exc_info=True)
+        print_message("red", "✗", f"Failed: {e}")
+        logger.error(f"Failed to update profile for {client.phone}: {e}")
 
-async def clear_contacts() -> None:
+async def clear_contacts():
     print_header("Clear Contacts")
     client = await select_and_login()
     if not client:
         return
-    
     try:
         contacts = await client.safe_execute(GetContactsRequest, hash=0)
         if not contacts.contacts:
-            print_info("No contacts to clear")
+            print_message("blue", "ℹ", "No contacts found")
             return
-            
-        table = Table(title=f"Found {len(contacts.contacts)} Contacts", box=box.ROUNDED, border_style="magenta")
+        
+        table = Table(title=f"Contacts ({len(contacts.contacts)})", box=box.ROUNDED, border_style="magenta")
         table.add_column("Name", style="magenta")
         table.add_column("Phone", style="green")
-        table.add_column("ID", style="cyan")
         for contact in contacts.contacts[:10]:
             user = next((u for u in contacts.users if u.id == contact.user_id), None)
             if user:
-                table.add_row(
-                    f"{user.first_name or ''} {user.last_name or ''}".strip(), 
-                    user.phone or "N/A",
-                    str(user.id)
-                )
+                table.add_row(f"{user.first_name or ''} {user.last_name or ''}".strip(), user.phone or "N/A")
         console.print(table)
         if len(contacts.contacts) > 10:
-            print_info(f"...and {len(contacts.contacts)-10} more contacts")
+            print_message("blue", "ℹ", f"...and {len(contacts.contacts) - 10} more")
         
-        if not Confirm.ask("[bold red]Delete ALL contacts?[/bold red]"):
+        if not Confirm.ask("[red]Delete all contacts?[/red]"):
             return
-            
-        async with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
-            task = progress.add_task("[red]Deleting contacts...", total=len(contacts.contacts))
+        
+        async with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+            task = progress.add_task("[red]Deleting...", total=len(contacts.contacts))
             batches = [contacts.contacts[i:i + config.BATCH_SIZE] for i in range(0, len(contacts.contacts), config.BATCH_SIZE)]
             for batch in batches:
                 await client.safe_execute(DeleteContactsRequest, id=[c.user_id for c in batch])
                 progress.update(task, advance=len(batch))
-                await asyncio.sleep(0.5)
-        
-        print_success(f"Deleted {len(contacts.contacts)} contacts")
+        print_message("green", "✓", f"Deleted {len(contacts.contacts)} contacts")
         logger.info(f"Deleted {len(contacts.contacts)} contacts for {client.phone}")
     except Exception as e:
-        print_error(f"Failed to clear contacts: {str(e)}")
-        logger.error(f"Failed to clear contacts: {str(e)}", exc_info=True)
+        print_message("red", "✗", f"Failed: {e}")
+        logger.error(f"Failed to clear contacts for {client.phone}: {e}")
 
-async def delete_all_chats_advanced() -> None:
+async def delete_all_chats_advanced():
     print_header("Advanced Chat Deletion")
     client = await select_and_login()
     if not client:
         return
-    
     try:
         dialogs = await client.safe_execute(GetDialogsRequest, offset_date=None, offset_id=0, offset_peer=types.InputPeerEmpty(), limit=500, hash=0)
         if not dialogs.dialogs:
-            print_info("No chats/channels found")
+            print_message("blue", "ℹ", "No chats or channels found")
             return
-            
-        table = Table(title=f"Found {len(dialogs.dialogs)} Chats/Channels", box=box.ROUNDED, border_style="yellow")
+        
+        table = Table(title=f"Chats/Channels ({len(dialogs.dialogs)})", box=box.ROUNDED, border_style="yellow")
         table.add_column("Type", style="cyan")
         table.add_column("Title", style="magenta")
-        table.add_column("ID", style="yellow")
         table.add_column("Members", style="white")
         for dialog in dialogs.dialogs[:10]:
             entity = dialog.entity
             chat_type = "Channel" if isinstance(entity, types.Channel) else "Chat"
             members = getattr(entity, 'participants_count', 'N/A')
-            table.add_row(chat_type, getattr(entity, 'title', 'Unknown'), str(entity.id), str(members))
+            table.add_row(chat_type, getattr(entity, 'title', 'Unknown'), str(members))
         console.print(table)
         if len(dialogs.dialogs) > 10:
-            print_info(f"...and {len(dialogs.dialogs)-10} more items")
+            print_message("blue", "ℹ", f"...and {len(dialogs.dialogs) - 10} more")
         
-        if not Confirm.ask("[bold red]Delete ALL chats/channels?[/bold red]"):
+        if not Confirm.ask("[red]Delete all chats and channels?[/red]"):
             return
-            
-        async with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
-            task = progress.add_task("[red]Deleting chats...", total=len(dialogs.dialogs))
+        
+        async with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+            task = progress.add_task("[red]Deleting...", total=len(dialogs.dialogs))
             tasks = []
             for dialog in dialogs.dialogs:
                 if isinstance(dialog.entity, types.Channel):
                     tasks.append(client.safe_execute(LeaveChannelRequest, channel=dialog.entity))
                 else:
                     tasks.append(client.client.delete_dialog(dialog.entity))
+                progress.update(task, advance=1)
             await asyncio.gather(*tasks)
-            progress.update(task, completed=len(dialogs.dialogs))
-        
-        print_success(f"Deleted {len(dialogs.dialogs)} chats/channels")
+        print_message("green", "✓", f"Deleted {len(dialogs.dialogs)} chats/channels")
         logger.info(f"Deleted {len(dialogs.dialogs)} chats/channels for {client.phone}")
     except Exception as e:
-        print_error(f"Error: {str(e)}")
-        logger.error(f"Error deleting chats: {str(e)}", exc_info=True)
+        print_message("red", "✗", f"Error: {e}")
+        logger.error(f"Error deleting chats for {client.phone}: {e}")
 
-async def check_spam_status() -> None:
+async def check_spam_status():
     print_header("Check Spam Status")
     client = await select_and_login()
     if not client:
         return
-    
     try:
         ttl = await client.safe_execute(GetAccountTTLRequest)
         test_msg = await client.safe_execute(client.client.send_message, "me", f"Spam check {datetime.now().isoformat()}")
-        status = "[green]UNRESTRICTED[/green]" if test_msg else "[red]RESTRICTED[/red]"
+        status = "[green]Unrestricted[/green]" if test_msg else "[red]Restricted[/red]"
         if test_msg:
             await client.safe_execute(client.client.delete_messages, "me", [test_msg.id])
         
@@ -710,22 +596,22 @@ async def check_spam_status() -> None:
         table.add_row("2FA Enabled", has_2fa)
         console.print(table)
     except Exception as e:
-        print_warning(f"Possible spam restriction: {str(e)}")
-        logger.warning(f"Spam check failed: {str(e)}", exc_info=True)
+        print_message("yellow", "⚠", f"Possible restriction: {e}")
+        logger.warning(f"Spam check failed for {client.phone}: {e}")
 
-async def read_session_otp() -> None:
+async def read_session_otp():
     print_header("Read OTP")
     client = await select_and_login()
     if not client:
         return
-    
     try:
         messages = await client.safe_execute(client.client.get_messages, "Telegram", limit=20)
         otps = []
         for msg in messages:
             if "login code" in msg.text.lower():
                 code = ''.join(filter(str.isdigit, msg.text))
-                otps.append((code, msg.date))
+                if code:
+                    otps.append((code, msg.date))
         
         if otps:
             for code, date in sorted(otps, key=lambda x: x[1], reverse=True)[:3]:
@@ -734,14 +620,14 @@ async def read_session_otp() -> None:
                     title="Login Code",
                     border_style="green"
                 ))
-                logger.info(f"OTP read: {code} for {client.phone}")
+                logger.info(f"OTP found for {client.phone}: {code}")
         else:
-            print_info("No recent OTPs found")
+            print_message("blue", "ℹ", "No recent OTPs found")
     except Exception as e:
-        print_error(f"Failed to read OTP: {str(e)}")
-        logger.error(f"Failed to read OTP: {str(e)}", exc_info=True)
+        print_message("red", "✗", f"Failed: {e}")
+        logger.error(f"Failed to read OTP for {client.phone}: {e}")
 
-async def manage_2fa() -> None:
+async def manage_2fa():
     print_header("2FA Management")
     client = await select_and_login()
     if not client:
@@ -757,12 +643,16 @@ async def manage_2fa() -> None:
         )
     
     async def enable_2fa():
-        password = getpass.getpass("[bold]Enter new 2FA password (min 8 chars): [/bold]")
+        password = getpass.getpass("Enter new 2FA password (min 8 chars): ")
         if len(password) < 8:
-            print_error("Password must be at least 8 characters")
+            print_message("red", "✗", "Password must be at least 8 characters")
             return
-        hint = Prompt.ask("[bold]Enter password hint (optional)[/bold]", default="")
-        email = Prompt.ask("[bold]Enter recovery email (optional)[/bold]", default="")
+        confirm_password = getpass.getpass("Confirm password: ")
+        if password != confirm_password:
+            print_message("red", "✗", "Passwords do not match")
+            return
+        hint = Prompt.ask("[cyan]Enter password hint (optional)[/cyan]", default="")
+        email = Prompt.ask("[cyan]Enter recovery email (optional)[/cyan]", default="")
         
         try:
             await client.client(functions.account.UpdatePasswordSettingsRequest(
@@ -779,16 +669,16 @@ async def manage_2fa() -> None:
                     email=email if email else None
                 )
             ))
-            print_success("2FA enabled successfully")
+            print_message("green", "✓", "2FA enabled successfully")
             logger.info(f"2FA enabled for {client.phone}")
         except Exception as e:
-            print_error(f"Failed to enable 2FA: {str(e)}")
-            logger.error(f"Failed to enable 2FA: {str(e)}", exc_info=True)
+            print_message("red", "✗", f"Failed to enable 2FA: {e}")
+            logger.error(f"Failed to enable 2FA for {client.phone}: {e}")
     
     async def disable_2fa():
-        if not Confirm.ask("[bold red]Are you sure you want to disable 2FA?[/bold red]"):
+        if not Confirm.ask("[red]Are you sure you want to disable 2FA?[/red]"):
             return
-        password = getpass.getpass("[bold red]Enter current 2FA password: [/bold red]")
+        password = getpass.getpass("Enter current 2FA password: ")
         try:
             await client.client(functions.account.UpdatePasswordSettingsRequest(
                 password=await get_password_hash(password),
@@ -798,19 +688,23 @@ async def manage_2fa() -> None:
                     hint=''
                 )
             ))
-            print_success("2FA disabled successfully")
+            print_message("green", "✓", "2FA disabled successfully")
             logger.info(f"2FA disabled for {client.phone}")
         except Exception as e:
-            print_error(f"Failed to disable 2FA: {str(e)}")
-            logger.error(f"Failed to disable 2FA: {str(e)}", exc_info=True)
+            print_message("red", "✗", f"Failed to disable 2FA: {e}")
+            logger.error(f"Failed to disable 2FA for {client.phone}: {e}")
     
     async def change_2fa_password():
-        current = getpass.getpass("[bold]Enter current 2FA password: [/bold]")
-        new_pass = getpass.getpass("[bold]Enter new 2FA password (min 8 chars): [/bold]")
+        current = getpass.getpass("Enter current 2FA password: ")
+        new_pass = getpass.getpass("Enter new 2FA password (min 8 chars): ")
         if len(new_pass) < 8:
-            print_error("New password must be at least 8 characters")
+            print_message("red", "✗", "New password must be at least 8 characters")
             return
-        hint = Prompt.ask("[bold]Enter new password hint (optional)[/bold]", default="")
+        confirm_new = getpass.getpass("Confirm new password: ")
+        if new_pass != confirm_new:
+            print_message("red", "✗", "Passwords do not match")
+            return
+        hint = Prompt.ask("[cyan]Enter new password hint (optional)[/cyan]", default="")
         
         try:
             await client.client(functions.account.UpdatePasswordSettingsRequest(
@@ -826,11 +720,11 @@ async def manage_2fa() -> None:
                     hint=hint
                 )
             ))
-            print_success("2FA password changed successfully")
+            print_message("green", "✓", "2FA password changed successfully")
             logger.info(f"2FA password changed for {client.phone}")
         except Exception as e:
-            print_error(f"Failed to change 2FA password: {str(e)}")
-            logger.error(f"Failed to change 2FA password: {str(e)}", exc_info=True)
+            print_message("red", "✗", f"Failed to change 2FA password: {e}")
+            logger.error(f"Failed to change 2FA password for {client.phone}: {e}")
     
     async def check_2fa_status():
         try:
@@ -843,8 +737,8 @@ async def manage_2fa() -> None:
             table.add_row("Email", "Set" if password_info.has_recovery else "Not set")
             console.print(table)
         except Exception as e:
-            print_error(f"Failed to check 2FA status: {str(e)}")
-            logger.error(f"Failed to check 2FA status: {str(e)}", exc_info=True)
+            print_message("red", "✗", f"Failed to check 2FA status: {e}")
+            logger.error(f"Failed to check 2FA status for {client.phone}: {e}")
 
     menu_options = {
         "1": ("Enable 2FA", enable_2fa),
@@ -863,37 +757,37 @@ async def manage_2fa() -> None:
             table.add_row(num, desc)
         console.print(table)
         
-        choice = Prompt.ask("[bold cyan]Select option[/bold cyan]", choices=list(menu_options.keys()))
+        choice = Prompt.ask("[cyan]Select option[/cyan]", choices=list(menu_options.keys()))
         if choice == "5":
             break
         await menu_options[choice][1]()
 
-async def export_sessions() -> None:
+async def export_sessions():
     print_header("Export Sessions")
     sessions = await list_sessions()
     if not sessions:
         return
-    
     try:
+        export_path = f"sessions_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         async with db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT phone, path, created_at, last_used, metadata, session_hash, status FROM sessions")
             data = cursor.fetchall()
         
-        export_path = f"sessions_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         async with aiofiles.open(export_path, 'w', newline='') as f:
-            await f.write("Phone,Path,Created At,Last Used,Metadata,Session Hash,Status\n")
+            writer = csv.writer(f)
+            await writer.writerow(["Phone", "Path", "Created At", "Last Used", "Metadata", "Session Hash", "Status"])
             for row in data:
                 metadata = json.dumps(json.loads(row[4]) if row[4] else {})
-                await f.write(f"{row[0]},{row[1]},{row[2]},{row[3]},{metadata},{row[5]},{row[6]}\n")
+                await writer.writerow([row[0], row[1], row[2], row[3], metadata, row[5], row[6]])
         
-        print_success(f"Exported {len(data)} sessions to {export_path}")
+        print_message("green", "✓", f"Exported {len(data)} sessions to {export_path}")
         logger.info(f"Exported {len(data)} sessions to {export_path}")
     except Exception as e:
-        print_error(f"Failed to export sessions: {str(e)}")
-        logger.error(f"Failed to export sessions: {str(e)}", exc_info=True)
+        print_message("red", "✗", f"Failed to export: {e}")
+        logger.error(f"Failed to export sessions: {e}")
 
-async def session_statistics() -> None:
+async def session_statistics():
     print_header("Session Statistics")
     try:
         async with db_connection() as conn:
@@ -902,7 +796,7 @@ async def session_statistics() -> None:
                 "Total Sessions": cursor.execute("SELECT COUNT(*) FROM sessions").fetchone()[0],
                 "Active Sessions": cursor.execute("SELECT COUNT(*) FROM sessions WHERE status = 'active'").fetchone()[0],
                 "Premium Accounts": cursor.execute("SELECT COUNT(*) FROM sessions WHERE json_extract(metadata, '$.premium') = 1").fetchone()[0],
-                "Recently Used": cursor.execute("SELECT COUNT(*) FROM sessions WHERE last_used > ?", (datetime.now(timezone.utc).isoformat(timespec='hours'),)).fetchone()[0]
+                "Recently Used (24h)": cursor.execute("SELECT COUNT(*) FROM sessions WHERE last_used > ?", (datetime.now(timezone.utc).replace(hour=0, minute=0, second=0).isoformat(),)).fetchone()[0]
             }
         
         table = Table(title="Session Statistics", box=box.ROUNDED, border_style="blue")
@@ -912,10 +806,10 @@ async def session_statistics() -> None:
             table.add_row(metric, str(value))
         console.print(table)
     except Exception as e:
-        print_error(f"Failed to get statistics: {str(e)}")
-        logger.error(f"Failed to get statistics: {str(e)}", exc_info=True)
+        print_message("red", "✗", f"Failed: {e}")
+        logger.error(f"Failed to get statistics: {e}")
 
-async def backup_sessions() -> None:
+async def backup_sessions():
     print_header("Backup Sessions")
     sessions = await list_sessions()
     if not sessions:
@@ -925,31 +819,26 @@ async def backup_sessions() -> None:
     backup_dir.mkdir(exist_ok=True)
     
     try:
-        async with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
-            task = progress.add_task("[green]Backing up sessions...", total=len(sessions))
-            tasks = []
-            async def backup_file(src, dest):
-                async with aiofiles.open(src, 'rb') as s, aiofiles.open(dest, 'wb') as d:
-                    await d.write(await s.read())
-                progress.update(task, advance=1)
-            
+        async with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+            task = progress.add_task("[green]Backing up...", total=len(sessions))
             for session in sessions:
                 dest = backup_dir / os.path.basename(session)
-                tasks.append(backup_file(session, dest))
-            await asyncio.gather(*tasks)
+                async with aiofiles.open(session, 'rb') as src, aiofiles.open(dest, 'wb') as dst:
+                    await dst.write(await src.read())
+                os.chmod(dest, 0o600)
+                progress.update(task, advance=1)
         
-        print_success(f"Backed up {len(sessions)} sessions to {backup_dir}")
+        print_message("green", "✓", f"Backed up {len(sessions)} sessions to {backup_dir}")
         logger.info(f"Backed up {len(sessions)} sessions to {backup_dir}")
     except Exception as e:
-        print_error(f"Failed to backup sessions: {str(e)}")
-        logger.error(f"Failed to backup sessions: {str(e)}", exc_info=True)
+        print_message("red", "✗", f"Failed: {e}")
+        logger.error(f"Failed to backup sessions: {e}")
 
-async def cleanup_sessions() -> None:
+async def cleanup_sessions():
     print_header("Cleanup Sessions")
     sessions = [str(p) for p in config.SESSION_FOLDER.glob("*.session")]
-    
     if not sessions:
-        print_info("No sessions to clean")
+        print_message("blue", "ℹ", "No sessions to clean")
         return
     
     async with db_connection() as conn:
@@ -959,10 +848,10 @@ async def cleanup_sessions() -> None:
     
     orphaned = [s for s in sessions if s not in db_paths]
     if not orphaned:
-        print_info("No orphaned sessions found")
+        print_message("blue", "ℹ", "No orphaned sessions found")
         return
     
-    table = Table(title=f"Found {len(orphaned)} Orphaned Sessions", box=box.ROUNDED, border_style="yellow")
+    table = Table(title=f"Orphaned Sessions ({len(orphaned)})", box=box.ROUNDED, border_style="yellow")
     table.add_column("File", style="yellow")
     table.add_column("Size (KB)", style="white")
     for session in orphaned[:10]:
@@ -970,22 +859,22 @@ async def cleanup_sessions() -> None:
         table.add_row(os.path.basename(session), f"{size:.2f}")
     console.print(table)
     if len(orphaned) > 10:
-        print_info(f"...and {len(orphaned)-10} more")
+        print_message("blue", "ℹ", f"...and {len(orphaned) - 10} more")
     
-    if not Confirm.ask("[bold red]Delete all orphaned sessions?[/bold red]"):
+    if not Confirm.ask("[red]Delete all orphaned sessions?[/red]"):
         return
     
-    async with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
-        task = progress.add_task("[red]Cleaning up...", total=len(orphaned))
-        tasks = [asyncio.get_event_loop().run_in_executor(executor, os.remove, session) for session in orphaned]
-        await asyncio.gather(*tasks)
-        progress.update(task, completed=len(orphaned))
+    async with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+        task = progress.add_task("[red]Cleaning...", total=len(orphaned))
+        for session in orphaned:
+            await asyncio.get_event_loop().run_in_executor(executor, os.remove, session)
+            progress.update(task, advance=1)
     
-    print_success(f"Cleaned up {len(orphaned)} orphaned sessions")
+    print_message("green", "✓", f"Cleaned up {len(orphaned)} orphaned sessions")
     logger.info(f"Cleaned up {len(orphaned)} orphaned sessions")
 
-async def bulk_session_check() -> None:
-    print_header("Bulk Session Health Check")
+async def bulk_session_check():
+    print_header("Bulk Session Check")
     sessions = await list_sessions()
     if not sessions:
         return
@@ -995,19 +884,20 @@ async def bulk_session_check() -> None:
         async with AdvancedTelegramClient(session, phone) as client:
             try:
                 connected = await client.connect()
-                status = "Healthy" if connected else "Invalid"
-                name = client._me.first_name if connected else "N/A"
-                return {"phone": phone, "status": status, "name": name}
+                return {
+                    "phone": phone,
+                    "status": "[green]Healthy[/green]" if connected else "[red]Invalid[/red]",
+                    "name": client._me.first_name if connected else "N/A"
+                }
             except Exception as e:
-                return {"phone": phone, "status": f"Error: {str(e)}", "name": "N/A"}
+                return {"phone": phone, "status": f"[red]Error: {e}[/red]", "name": "N/A"}
     
-    async with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
-        task = progress.add_task("[cyan]Checking sessions...", total=len(sessions))
-        tasks = [check_session(session) for session in sessions]
-        results = await asyncio.gather(*tasks)
+    async with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+        task = progress.add_task("[cyan]Checking...", total=len(sessions))
+        results = await asyncio.gather(*[check_session(s) for s in sessions])
         progress.update(task, completed=len(sessions))
     
-    table = Table(title="Session Health Check", box=box.ROUNDED, border_style="cyan")
+    table = Table(title="Session Health", box=box.ROUNDED, border_style="cyan")
     table.add_column("Phone", style="magenta")
     table.add_column("Status", style="green")
     table.add_column("Name", style="cyan")
@@ -1016,11 +906,78 @@ async def bulk_session_check() -> None:
     console.print(table)
     
     unhealthy = [r["phone"] for r in results if "Healthy" not in r["status"]]
-    if unhealthy and Confirm.ask("[bold yellow]Mark unhealthy sessions as inactive?[/bold yellow]"):
+    if unhealthy and Confirm.ask("[yellow]Mark unhealthy sessions as inactive?[/yellow]"):
         async with db_connection() as conn:
             conn.executemany("UPDATE sessions SET status = 'inactive' WHERE phone = ?", [(p,) for p in unhealthy])
-        print_success(f"Marked {len(unhealthy)} sessions as inactive")
+        print_message("green", "✓", f"Marked {len(unhealthy)} sessions as inactive")
         logger.info(f"Marked {len(unhealthy)} sessions as inactive")
+
+async def add_session_note():
+    print_header("Add Session Note")
+    sessions = await list_sessions()
+    if not sessions:
+        return
+    
+    choice = Prompt.ask(f"[cyan]Select session (1-{len(sessions)}, 'q' to quit)[/cyan]", default="q")
+    if choice.lower() == 'q':
+        return
+    
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(sessions):
+            phone = f"+{os.path.basename(sessions[idx]).replace('.session', '')}"
+            note = Prompt.ask("[cyan]Enter note for this session[/cyan]")
+            async with db_connection() as conn:
+                conn.execute("UPDATE sessions SET notes = ? WHERE phone = ?", (note, phone))
+            print_message("green", "✓", f"Added note to {phone}")
+            logger.info(f"Added note to {phone}: {note}")
+        else:
+            print_message("red", "✗", f"Invalid choice (1-{len(sessions)})")
+    except ValueError:
+        print_message("red", "✗", "Invalid input")
+
+async def view_session_notes():
+    print_header("View Session Notes")
+    async with db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT phone, notes FROM sessions WHERE notes IS NOT NULL")
+        notes = cursor.fetchall()
+    
+    if not notes:
+        print_message("blue", "ℹ", "No notes found")
+        return
+    
+    table = Table(title="Session Notes", box=box.ROUNDED, border_style="blue")
+    table.add_column("Phone", style="magenta")
+    table.add_column("Note", style="white")
+    for phone, note in notes:
+        table.add_row(phone, note)
+    console.print(table)
+
+async def delete_session():
+    print_header("Delete Session")
+    sessions = await list_sessions()
+    if not sessions:
+        return
+    
+    choice = Prompt.ask(f"[cyan]Select session to delete (1-{len(sessions)}, 'q' to quit)[/cyan]", default="q")
+    if choice.lower() == 'q':
+        return
+    
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(sessions):
+            phone = f"+{os.path.basename(sessions[idx]).replace('.session', '')}"
+            if Confirm.ask(f"[red]Delete session {phone}? This cannot be undone![/red]"):
+                async with db_connection() as conn:
+                    conn.execute("DELETE FROM sessions WHERE phone = ?", (phone,))
+                os.remove(sessions[idx])
+                print_message("green", "✓", f"Deleted session {phone}")
+                logger.info(f"Deleted session {phone}")
+        else:
+            print_message("red", "✗", f"Invalid choice (1-{len(sessions)})")
+    except ValueError:
+        print_message("red", "✗", "Invalid input")
 
 def create_main_layout() -> Layout:
     layout = Layout()
@@ -1031,24 +988,27 @@ def create_main_layout() -> Layout:
     )
     return layout
 
-async def main() -> None:
+async def main():
     menu_options = {
-        "1": ("Create New Session", "Create a new Telegram session", create_session),
-        "2": ("List Saved Sessions", "View all saved sessions", list_sessions),
-        "3": ("Terminate Other Sessions", "End all other active sessions", terminate_other_sessions),
-        "4": ("Show Active Sessions", "Display current active sessions", show_active_sessions),
-        "5": ("Update Profile", "Change profile name and about", update_profile_random_name),
-        "6": ("Clear Contacts", "Remove all contacts", clear_contacts),
-        "7": ("Advanced Chat Deletion", "Delete all chats and channels", delete_all_chats_advanced),
-        "8": ("Check Spam Status", "Verify account restrictions", check_spam_status),
-        "9": ("Read OTP", "Fetch recent login codes", read_session_otp),
-        "10": ("2FA Management", "Manage two-factor authentication", manage_2fa),
-        "11": ("Export Sessions", "Export sessions to CSV", export_sessions),
-        "12": ("Session Statistics", "View session stats", session_statistics),
-        "13": ("Backup Sessions", "Backup all sessions", backup_sessions),
-        "14": ("Cleanup Sessions", "Remove orphaned sessions", cleanup_sessions),
-        "15": ("Bulk Session Check", "Check health of all sessions", bulk_session_check),
-        "16": ("Exit", "Quit the application", lambda: None)
+        "1": ("Create New Session", create_session),
+        "2": ("List Saved Sessions", list_sessions),
+        "3": ("Terminate Other Sessions", terminate_other_sessions),
+        "4": ("Show Active Sessions", show_active_sessions),
+        "5": ("Update Profile", update_profile_random_name),
+        "6": ("Clear Contacts", clear_contacts),
+        "7": ("Delete Chats/Channels", delete_all_chats_advanced),
+        "8": ("Check Spam Status", check_spam_status),
+        "9": ("Read OTP", read_session_otp),
+        "10": ("2FA Management", manage_2fa),
+        "11": ("Export Sessions", export_sessions),
+        "12": ("Session Statistics", session_statistics),
+        "13": ("Backup Sessions", backup_sessions),
+        "14": ("Cleanup Sessions", cleanup_sessions),
+        "15": ("Bulk Session Check", bulk_session_check),
+        "16": ("Add Session Note", add_session_note),
+        "17": ("View Session Notes", view_session_notes),
+        "18": ("Delete Session", delete_session),
+        "19": ("Exit", lambda: None)
     }
     
     layout = create_main_layout()
@@ -1065,28 +1025,27 @@ async def main() -> None:
     
     async def update_footer():
         layout["footer"].update(Panel(
-            f"[bold blue]Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Ctrl+C to Exit[/bold blue]",
+            f"[blue]Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Ctrl+C to Exit[/blue]",
             border_style="blue"
         ))
     
     while True:
         await update_header()
-        table = Table(box=box.ROUNDED, show_header=True, header_style="bold magenta", border_style="magenta")
+        table = Table(box=box.ROUNDED, header_style="bold magenta", border_style="magenta")
         table.add_column("Option", style="cyan", width=8, justify="right")
         table.add_column("Action", style="magenta", width=25)
-        table.add_column("Description", style="white")
-        for num, (action, desc, _) in menu_options.items():
-            table.add_row(num, action, desc)
+        for num, (action, _) in menu_options.items():
+            table.add_row(num, action)
         layout["main"].update(table)
         
         with Live(layout, console=console, refresh_per_second=1):
             await update_footer()
-            choice = Prompt.ask("[bold cyan]Select option (1-16)[/bold cyan]", choices=list(menu_options.keys()))
+            choice = Prompt.ask("[cyan]Select option (1-19)[/cyan]", choices=list(menu_options.keys()))
         
-        if choice == "16":
-            print_success("Goodbye!")
+        if choice == "19":
+            print_message("green", "✓", "Goodbye!")
             break
-        await menu_options[choice][2]()
+        await menu_options[choice][1]()
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
@@ -1094,11 +1053,11 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        console.print("\n[bold red]✗ Operation cancelled by user[/bold red]")
+        console.print("\n[red]✗ Operation cancelled[/red]")
         sys.exit(0)
     except Exception as e:
-        print_error(f"Fatal error: {str(e)}")
-        logger.error(f"Fatal error: {str(e)}", exc_info=True)
+        print_message("red", "✗", f"Fatal error: {e}")
+        logger.error(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)
     finally:
-        executor.shutdown()
+        executor.shutdown(wait=False)
