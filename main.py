@@ -35,6 +35,7 @@ from telethon.errors import (
     SessionPasswordNeededError,
     FloodWaitError,
     PhoneNumberInvalidError,
+    PhoneCodeInvalidError,
     RPCError
 )
 from telethon.sessions import StringSession
@@ -321,65 +322,71 @@ async def create_session() -> Optional[str]:
         return session_path
     
     async with TelegramClient(StringSession(), config.API_ID, config.API_HASH) as temp_client:
-        for attempt in range(config.MAX_RETRIES):
-            try:
-                with console.status("[bold cyan]Connecting to Telegram...", spinner="dots"):
-                    await temp_client.connect()
-                print_info(f"Sending code to {phone}...")
-                await temp_client.send_code_request(phone)
+        try:
+            with console.status("[bold cyan]Connecting to Telegram...", spinner="dots"):
+                await temp_client.connect()
+            print_info(f"Sending code to {phone}...")
+            sent_code = await temp_client.send_code_request(phone)
+            phone_code_hash = sent_code.phone_code_hash
+            
+            for code_attempt in range(3):  # Allow 3 attempts for code
                 code = Prompt.ask("[bold yellow]Enter code (or 'q' to quit)[/bold yellow]", default="q")
                 if code.lower() == 'q':
                     return None
                 try:
-                    await temp_client.sign_in(phone, code)
+                    await temp_client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+                    break
+                except PhoneCodeInvalidError:
+                    print_warning("Invalid code. Please try again.")
+                    if code_attempt == 2:
+                        print_error("Too many invalid code attempts.")
+                        return None
                 except SessionPasswordNeededError:
                     password = getpass.getpass("[bold red]Enter 2FA password: [/bold red]")
                     await temp_client.sign_in(password=password)
-                
-                me = await temp_client.get_me()
-                metadata = {
-                    "username": me.username,
-                    "first_name": me.first_name,
-                    "last_name": me.last_name,
-                    "premium": me.premium,
-                    "language": me.lang_code
-                }
-                session_string = temp_client.session.save()
-                async with aiofiles.open(session_path, 'w') as f:
-                    await f.write(session_string)
-                os.chmod(session_path, 0o664)
-                async with db_connection() as conn:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO sessions (phone, path, created_at, last_used, metadata, session_hash) VALUES (?, ?, ?, ?, ?, ?)",
-                        (phone, session_path, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat(), json.dumps(metadata), sha256(f"{phone}{datetime.now().isoformat()}".encode()).hexdigest()[:16])
-                    )
-                print_success(f"Session created for {me.first_name} {me.last_name or ''} ({me.phone})")
-                logger.info(f"New session created for {phone}")
-                return session_path
-            except PhoneNumberInvalidError as e:
-                print_error(f"Invalid phone number: {str(e)}")
-                return None
-            except RPCError as e:
-                if "FLOOD_WAIT" in str(e):
-                    wait = int(str(e).split()[1]) if str(e).split()[1].isdigit() else 300
-                    console.print(f"[bold yellow]⚠ Flood wait required: {wait}s. Retrying after delay...[/bold yellow]")
-                    await asyncio.sleep(wait)
-                elif "ResendCodeRequest" in str(e):
-                    console.print("[bold yellow]⚠ Telegram verification limit reached. Please wait and try again later.[/bold yellow]")
-                    return None
-                else:
-                    print_error(f"Failed to create session: {str(e)}")
-                    return None
-            except Exception as e:
-                print_error(f"Attempt {attempt+1} failed: {str(e)}")
-                if attempt < config.MAX_RETRIES - 1:
-                    await asyncio.sleep(config.RETRY_DELAY * (2 ** attempt))
-                else:
-                    print_error(f"Failed to create session after {config.MAX_RETRIES} attempts")
-                    return None
-            finally:
-                if temp_client.is_connected():
-                    await temp_client.disconnect()
+                    break
+            
+            me = await temp_client.get_me()
+            metadata = {
+                "username": me.username,
+                "first_name": me.first_name,
+                "last_name": me.last_name,
+                "premium": me.premium,
+                "language": me.lang_code
+            }
+            session_string = temp_client.session.save()
+            async with aiofiles.open(session_path, 'w') as f:
+                await f.write(session_string)
+            os.chmod(session_path, 0o664)
+            async with db_connection() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO sessions (phone, path, created_at, last_used, metadata, session_hash) VALUES (?, ?, ?, ?, ?, ?)",
+                    (phone, session_path, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat(), json.dumps(metadata), sha256(f"{phone}{datetime.now().isoformat()}".encode()).hexdigest()[:16])
+                )
+            print_success(f"Session created for {me.first_name} {me.last_name or ''} ({me.phone})")
+            logger.info(f"New session created for {phone}")
+            return session_path
+            
+        except PhoneNumberInvalidError as e:
+            print_error(f"Invalid phone number: {str(e)}")
+            return None
+        except FloodWaitError as e:
+            wait = min(e.seconds, 3600)
+            print_warning(f"Flood wait required: {wait}s. Please try again later.")
+            return None
+        except RPCError as e:
+            if "ResendCodeRequest" in str(e):
+                print_warning("Telegram verification limit reached. Please wait and try again later.")
+            else:
+                print_error(f"Failed to create session: {str(e)}")
+            return None
+        except Exception as e:
+            print_error(f"Failed to create session: {str(e)}")
+            logger.error(f"Failed to create session for {phone}: {str(e)}", exc_info=True)
+            return None
+        finally:
+            if temp_client.is_connected():
+                await temp_client.disconnect()
 
 async def list_sessions(status_filter: str = "active") -> Optional[List[str]]:
     sessions = [str(p) for p in config.SESSION_FOLDER.glob("*.session")]
