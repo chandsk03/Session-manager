@@ -43,10 +43,12 @@ from colorama import Fore, Style, init
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
-from rich.progress import Progress
+from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich import box
 from rich.status import Status
 from rich.prompt import Prompt, Confirm
+from rich.layout import Layout
+from rich.live import Live
 
 # Initialize
 init(autoreset=True)
@@ -285,10 +287,11 @@ class AdvancedTelegramClient:
 
 def print_header(title: str) -> None:
     console.print(Panel.fit(
-        title,
+        f"[bold cyan]{title}[/bold cyan]",
         style="bold cyan",
         border_style="blue",
-        subtitle=f"Advanced Session Manager v5.1 (Telethon {telethon_version})"
+        subtitle=f"Advanced Session Manager v5.1 | Telethon {telethon_version}",
+        subtitle_align="right"
     ))
 
 def print_success(message: str) -> None:
@@ -311,9 +314,9 @@ def validate_phone(phone: str) -> bool:
 
 async def create_session() -> Optional[str]:
     print_header("Create New Session")
-    phone = Prompt.ask("[bold cyan]Enter phone number (e.g., +919108166334)[/bold cyan]", default="+")
+    phone = Prompt.ask("[bold cyan]Enter phone number (e.g., +8801720197116)[/bold cyan]", default="+")
     if not validate_phone(phone):
-        print_error("Invalid phone number format. Use full international format (e.g., +919108166334)")
+        print_error("Invalid phone number format. Use full international format (e.g., +8801720197116)")
         return None
     
     session_path = str(config.SESSION_FOLDER / f"{phone[1:]}.session")
@@ -329,7 +332,7 @@ async def create_session() -> Optional[str]:
             sent_code = await temp_client.send_code_request(phone)
             phone_code_hash = sent_code.phone_code_hash
             
-            for code_attempt in range(3):  # Allow 3 attempts for code
+            for code_attempt in range(3):
                 code = Prompt.ask("[bold yellow]Enter code (or 'q' to quit)[/bold yellow]", default="q")
                 if code.lower() == 'q':
                     return None
@@ -389,7 +392,19 @@ async def create_session() -> Optional[str]:
                 await temp_client.disconnect()
 
 async def list_sessions(status_filter: str = "active") -> Optional[List[str]]:
-    sessions = [str(p) for p in config.SESSION_FOLDER.glob("*.session")]
+    # Normalize session files (remove '+' prefix if present)
+    sessions = []
+    for p in config.SESSION_FOLDER.glob("*.session"):
+        filename = p.name
+        if filename.startswith('+'):
+            normalized_path = str(config.SESSION_FOLDER / filename[1:])
+            if not os.path.exists(normalized_path):
+                os.rename(str(p), normalized_path)
+                logger.info(f"Normalized session file: {filename} -> {filename[1:]}")
+            sessions.append(normalized_path)
+        else:
+            sessions.append(str(p))
+    
     if not sessions:
         print_warning("No saved sessions found")
         return None
@@ -404,6 +419,7 @@ async def list_sessions(status_filter: str = "active") -> Optional[List[str]]:
             if session not in known_sessions:
                 phone = f"+{os.path.basename(session).replace('.session', '')}"
                 if not validate_phone(phone):
+                    print_warning(f"Invalid phone format in session file: {os.path.basename(session)}")
                     continue
                 async with AdvancedTelegramClient(session, phone) as client:
                     if await client.connect():
@@ -420,16 +436,26 @@ async def list_sessions(status_filter: str = "active") -> Optional[List[str]]:
                             (phone, session, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat(), json.dumps(metadata), client._generate_session_hash())
                         )
                         conn.commit()
-                        print_success(f"Added manually detected session: {phone}")
+                        print_success(f"Detected and added manual session: {phone} ({me.first_name})")
                         logger.info(f"Manually detected and added session: {phone}")
+                    else:
+                        print_warning(f"Failed to validate manual session: {phone}")
+                        logger.warning(f"Failed to validate manual session: {phone}")
     
-    table = Table(title=f"Available Sessions ({status_filter})", box=box.ROUNDED, header_style="bold magenta")
-    table.add_column("#", style="cyan", justify="right")
-    table.add_column("Phone", style="magenta")
-    table.add_column("File", style="yellow")
-    table.add_column("Last Used", style="blue")
-    table.add_column("Username", style="cyan")
-    table.add_column("Hash", style="white")
+    table = Table(
+        title=f"[bold magenta]Available Sessions ({status_filter})[/bold magenta]",
+        box=box.ROUNDED,
+        header_style="bold magenta",
+        border_style="blue",
+        show_lines=True
+    )
+    table.add_column("#", style="cyan", justify="right", width=3)
+    table.add_column("Phone", style="magenta", width=15)
+    table.add_column("File", style="yellow", width=20)
+    table.add_column("Last Used", style="blue", width=20)
+    table.add_column("Username", style="cyan", width=15)
+    table.add_column("Hash", style="white", width=8)
+    table.add_column("Status", style="green", width=10)
     
     filtered_sessions = []
     async with db_connection() as conn:
@@ -442,11 +468,16 @@ async def list_sessions(status_filter: str = "active") -> Optional[List[str]]:
             phone = f"+{session_name}"
             if phone in db_sessions:
                 row = db_sessions[phone]
-                last_used = row[2] if row[2] else "Never"
+                last_used = row[2][:19] if row[2] else "Never"
                 metadata = json.loads(row[3]) if row[3] else {}
                 username = metadata.get("username", "N/A")
                 session_hash = row[4][:8] if row[4] else "N/A"
-                table.add_row(str(i), phone, os.path.basename(session), last_used, username, session_hash)
+                status = "[green]Active[/green]" if row[5] == "active" else "[red]Inactive[/red]"
+                table.add_row(str(i), phone, os.path.basename(session), last_used, username, session_hash, status)
+                filtered_sessions.append(session)
+            else:
+                # Show unverified sessions as pending
+                table.add_row(str(i), phone, os.path.basename(session), "Pending", "N/A", "N/A", "[yellow]Unverified[/yellow]")
                 filtered_sessions.append(session)
     
     console.print(table)
@@ -468,7 +499,10 @@ async def select_and_login() -> Optional['AdvancedTelegramClient']:
                 client = AdvancedTelegramClient(sessions[choice], phone)
                 if await client.connect():
                     return client
-            print_error(f"Invalid selection. Choose between 1 and {len(sessions)}")
+                else:
+                    print_error(f"Failed to connect to session {phone}")
+            else:
+                print_error(f"Invalid selection. Choose between 1 and {len(sessions)}")
         except ValueError:
             print_error("Please enter a valid number or 'q'")
 
@@ -486,7 +520,7 @@ async def terminate_other_sessions() -> None:
             print_info("No other active sessions found")
             return
             
-        table = Table(title="Other Sessions", box=box.ROUNDED, header_style="bold red")
+        table = Table(title="Other Sessions", box=box.ROUNDED, header_style="bold red", border_style="red")
         table.add_column("Device", style="cyan")
         table.add_column("IP", style="magenta")
         table.add_column("Location", style="yellow")
@@ -498,7 +532,7 @@ async def terminate_other_sessions() -> None:
         if not Confirm.ask("[bold red]Confirm termination of ALL other sessions?[/bold red]"):
             return
             
-        async with Progress() as progress:
+        async with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
             task = progress.add_task("[red]Terminating sessions...", total=len(other_sessions))
             tasks = [client.safe_execute(ResetAuthorizationRequest, hash=auth.hash) for auth in other_sessions]
             await asyncio.gather(*tasks)
@@ -518,7 +552,7 @@ async def show_active_sessions() -> None:
     
     try:
         auths = await client.safe_execute(GetAuthorizationsRequest())
-        table = Table(title=f"Active Sessions ({len(auths.authorizations)})", box=box.ROUNDED, header_style="bold cyan")
+        table = Table(title=f"Active Sessions ({len(auths.authorizations)})", box=box.ROUNDED, header_style="bold cyan", border_style="cyan")
         table.add_column("Status", style="bold")
         table.add_column("Device", style="cyan")
         table.add_column("IP", style="magenta")
@@ -573,7 +607,7 @@ async def clear_contacts() -> None:
             print_info("No contacts to clear")
             return
             
-        table = Table(title=f"Found {len(contacts.contacts)} Contacts", box=box.ROUNDED)
+        table = Table(title=f"Found {len(contacts.contacts)} Contacts", box=box.ROUNDED, border_style="magenta")
         table.add_column("Name", style="magenta")
         table.add_column("Phone", style="green")
         table.add_column("ID", style="cyan")
@@ -592,7 +626,7 @@ async def clear_contacts() -> None:
         if not Confirm.ask("[bold red]Delete ALL contacts?[/bold red]"):
             return
             
-        async with Progress() as progress:
+        async with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
             task = progress.add_task("[red]Deleting contacts...", total=len(contacts.contacts))
             batches = [contacts.contacts[i:i + config.BATCH_SIZE] for i in range(0, len(contacts.contacts), config.BATCH_SIZE)]
             for batch in batches:
@@ -618,7 +652,7 @@ async def delete_all_chats_advanced() -> None:
             print_info("No chats/channels found")
             return
             
-        table = Table(title=f"Found {len(dialogs.dialogs)} Chats/Channels", box=box.ROUNDED)
+        table = Table(title=f"Found {len(dialogs.dialogs)} Chats/Channels", box=box.ROUNDED, border_style="yellow")
         table.add_column("Type", style="cyan")
         table.add_column("Title", style="magenta")
         table.add_column("ID", style="yellow")
@@ -635,7 +669,7 @@ async def delete_all_chats_advanced() -> None:
         if not Confirm.ask("[bold red]Delete ALL chats/channels?[/bold red]"):
             return
             
-        async with Progress() as progress:
+        async with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
             task = progress.add_task("[red]Deleting chats...", total=len(dialogs.dialogs))
             tasks = []
             for dialog in dialogs.dialogs:
@@ -668,7 +702,7 @@ async def check_spam_status() -> None:
         password_info = await client.safe_execute(GetPasswordRequest)
         has_2fa = "Yes" if password_info.has_password else "No"
         
-        table = Table(title="Account Status", box=box.ROUNDED)
+        table = Table(title="Account Status", box=box.ROUNDED, border_style="green")
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="magenta")
         table.add_row("Account TTL", f"{ttl.days} days")
@@ -696,7 +730,7 @@ async def read_session_otp() -> None:
         if otps:
             for code, date in sorted(otps, key=lambda x: x[1], reverse=True)[:3]:
                 console.print(Panel(
-                    f"OTP: [bold green]{code}[/bold green]\nReceived: {date}",
+                    f"OTP: [bold green]{code}[/bold green]\nReceived: {date.strftime('%Y-%m-%d %H:%M:%S')}",
                     title="Login Code",
                     border_style="green"
                 ))
@@ -801,7 +835,7 @@ async def manage_2fa() -> None:
     async def check_2fa_status():
         try:
             password_info = await client.safe_execute(GetPasswordRequest)
-            table = Table(title="2FA Status", box=box.ROUNDED)
+            table = Table(title="2FA Status", box=box.ROUNDED, border_style="cyan")
             table.add_column("Property", style="cyan")
             table.add_column("Value", style="magenta")
             table.add_row("Enabled", "Yes" if password_info.has_password else "No")
@@ -821,8 +855,9 @@ async def manage_2fa() -> None:
     }
     
     while True:
-        table = Table(box=box.ROUNDED, show_header=False)
-        table.add_column("Option", style="cyan")
+        print_header("2FA Management Menu")
+        table = Table(box=box.ROUNDED, show_header=False, border_style="magenta")
+        table.add_column("Option", style="cyan", width=8)
         table.add_column("Action", style="magenta")
         for num, (desc, _) in menu_options.items():
             table.add_row(num, desc)
@@ -870,7 +905,7 @@ async def session_statistics() -> None:
                 "Recently Used": cursor.execute("SELECT COUNT(*) FROM sessions WHERE last_used > ?", (datetime.now(timezone.utc).isoformat(timespec='hours'),)).fetchone()[0]
             }
         
-        table = Table(title="Session Statistics", box=box.ROUNDED)
+        table = Table(title="Session Statistics", box=box.ROUNDED, border_style="blue")
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="magenta")
         for metric, value in stats.items():
@@ -890,7 +925,7 @@ async def backup_sessions() -> None:
     backup_dir.mkdir(exist_ok=True)
     
     try:
-        async with Progress() as progress:
+        async with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
             task = progress.add_task("[green]Backing up sessions...", total=len(sessions))
             tasks = []
             async def backup_file(src, dest):
@@ -927,7 +962,7 @@ async def cleanup_sessions() -> None:
         print_info("No orphaned sessions found")
         return
     
-    table = Table(title=f"Found {len(orphaned)} Orphaned Sessions", box=box.ROUNDED)
+    table = Table(title=f"Found {len(orphaned)} Orphaned Sessions", box=box.ROUNDED, border_style="yellow")
     table.add_column("File", style="yellow")
     table.add_column("Size (KB)", style="white")
     for session in orphaned[:10]:
@@ -940,7 +975,7 @@ async def cleanup_sessions() -> None:
     if not Confirm.ask("[bold red]Delete all orphaned sessions?[/bold red]"):
         return
     
-    async with Progress() as progress:
+    async with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
         task = progress.add_task("[red]Cleaning up...", total=len(orphaned))
         tasks = [asyncio.get_event_loop().run_in_executor(executor, os.remove, session) for session in orphaned]
         await asyncio.gather(*tasks)
@@ -966,13 +1001,13 @@ async def bulk_session_check() -> None:
             except Exception as e:
                 return {"phone": phone, "status": f"Error: {str(e)}", "name": "N/A"}
     
-    async with Progress() as progress:
+    async with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
         task = progress.add_task("[cyan]Checking sessions...", total=len(sessions))
         tasks = [check_session(session) for session in sessions]
         results = await asyncio.gather(*tasks)
         progress.update(task, completed=len(sessions))
     
-    table = Table(title="Session Health Check", box=box.ROUNDED)
+    table = Table(title="Session Health Check", box=box.ROUNDED, border_style="cyan")
     table.add_column("Phone", style="magenta")
     table.add_column("Status", style="green")
     table.add_column("Name", style="cyan")
@@ -987,40 +1022,71 @@ async def bulk_session_check() -> None:
         print_success(f"Marked {len(unhealthy)} sessions as inactive")
         logger.info(f"Marked {len(unhealthy)} sessions as inactive")
 
+def create_main_layout() -> Layout:
+    layout = Layout()
+    layout.split_column(
+        Layout(name="header", size=3),
+        Layout(name="main", ratio=1),
+        Layout(name="footer", size=2)
+    )
+    return layout
+
 async def main() -> None:
     menu_options = {
-        "1": ("Create New Session", create_session),
-        "2": ("List Saved Sessions", list_sessions),
-        "3": ("Terminate Other Sessions", terminate_other_sessions),
-        "4": ("Show Active Sessions", show_active_sessions),
-        "5": ("Update Profile", update_profile_random_name),
-        "6": ("Clear Contacts", clear_contacts),
-        "7": ("Advanced Chat Deletion", delete_all_chats_advanced),
-        "8": ("Check Spam Status", check_spam_status),
-        "9": ("Read OTP", read_session_otp),
-        "10": ("2FA Management", manage_2fa),
-        "11": ("Export Sessions", export_sessions),
-        "12": ("Session Statistics", session_statistics),
-        "13": ("Backup Sessions", backup_sessions),
-        "14": ("Cleanup Sessions", cleanup_sessions),
-        "15": ("Bulk Session Check", bulk_session_check),
-        "16": ("Exit", lambda: None)
+        "1": ("Create New Session", "Create a new Telegram session", create_session),
+        "2": ("List Saved Sessions", "View all saved sessions", list_sessions),
+        "3": ("Terminate Other Sessions", "End all other active sessions", terminate_other_sessions),
+        "4": ("Show Active Sessions", "Display current active sessions", show_active_sessions),
+        "5": ("Update Profile", "Change profile name and about", update_profile_random_name),
+        "6": ("Clear Contacts", "Remove all contacts", clear_contacts),
+        "7": ("Advanced Chat Deletion", "Delete all chats and channels", delete_all_chats_advanced),
+        "8": ("Check Spam Status", "Verify account restrictions", check_spam_status),
+        "9": ("Read OTP", "Fetch recent login codes", read_session_otp),
+        "10": ("2FA Management", "Manage two-factor authentication", manage_2fa),
+        "11": ("Export Sessions", "Export sessions to CSV", export_sessions),
+        "12": ("Session Statistics", "View session stats", session_statistics),
+        "13": ("Backup Sessions", "Backup all sessions", backup_sessions),
+        "14": ("Cleanup Sessions", "Remove orphaned sessions", cleanup_sessions),
+        "15": ("Bulk Session Check", "Check health of all sessions", bulk_session_check),
+        "16": ("Exit", "Quit the application", lambda: None)
     }
     
+    layout = create_main_layout()
+    
+    async def update_header():
+        async with db_connection() as conn:
+            total_sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        layout["header"].update(Panel(
+            f"[bold cyan]Telegram Advanced Session Manager[/bold cyan] | Sessions: {total_sessions}",
+            border_style="blue",
+            subtitle=f"v5.1 | Telethon {telethon_version}",
+            subtitle_align="right"
+        ))
+    
+    async def update_footer():
+        layout["footer"].update(Panel(
+            f"[bold blue]Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Ctrl+C to Exit[/bold blue]",
+            border_style="blue"
+        ))
+    
     while True:
-        print_header("Telegram Advanced Session Manager")
-        table = Table(box=box.ROUNDED, show_header=False)
-        table.add_column("Option", style="cyan", justify="right")
-        table.add_column("Description", style="magenta")
-        for num, (desc, _) in menu_options.items():
-            table.add_row(num, desc)
-        console.print(table)
+        await update_header()
+        table = Table(box=box.ROUNDED, show_header=True, header_style="bold magenta", border_style="magenta")
+        table.add_column("Option", style="cyan", width=8, justify="right")
+        table.add_column("Action", style="magenta", width=25)
+        table.add_column("Description", style="white")
+        for num, (action, desc, _) in menu_options.items():
+            table.add_row(num, action, desc)
+        layout["main"].update(table)
         
-        choice = Prompt.ask("[bold cyan]Select option (1-16)[/bold cyan]", choices=list(menu_options.keys()))
+        with Live(layout, console=console, refresh_per_second=1):
+            await update_footer()
+            choice = Prompt.ask("[bold cyan]Select option (1-16)[/bold cyan]", choices=list(menu_options.keys()))
+        
         if choice == "16":
             print_success("Goodbye!")
             break
-        await menu_options[choice][1]()
+        await menu_options[choice][2]()
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
