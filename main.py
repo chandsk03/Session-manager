@@ -10,14 +10,12 @@ import sqlite3
 import json
 import aiofiles
 import csv
-import shutil
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 import logging
 from logging.handlers import RotatingFileHandler
-from importlib.metadata import version
 from pathlib import Path
 from contextlib import asynccontextmanager
 from telethon import TelegramClient, functions, types, __version__ as telethon_version
@@ -26,8 +24,7 @@ from telethon.errors import (
     FloodWaitError,
     PhoneNumberInvalidError,
     PhoneCodeInvalidError,
-    RPCError,
-    TwoFaRequiredError
+    RPCError
 )
 from telethon.sessions import StringSession
 from telethon.tl.functions.account import (
@@ -49,17 +46,19 @@ from rich import box
 from rich.prompt import Prompt, Confirm
 from rich.layout import Layout
 from rich.live import Live
+from rich.text import Text
 
 # Initialize
 console = Console()
 executor = ThreadPoolExecutor(max_workers=4)
+VERSION = "5.2"
 
-# Configure logging (file only)
+# Configure logging
 if not os.path.exists('logs'):
     os.makedirs('logs')
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s - [%(filename)s:%(lineno)d] - Thread: %(threadName)s',
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s - [%(filename)s:%(lineno)d]',
     handlers=[RotatingFileHandler('logs/session_manager.log', maxBytes=10*1024*1024, backupCount=10)]
 )
 logger = logging.getLogger(__name__)
@@ -133,6 +132,7 @@ class SecureConfig:
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_phone ON sessions(phone)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON sessions(status)")
+            conn.commit()
             logger.info("Created new sessions database")
 
 config = SecureConfig()
@@ -165,24 +165,27 @@ class AdvancedTelegramClient:
     async def connect(self) -> bool:
         if self._connected:
             return True
+            
+        session = StringSession()
+        if os.path.exists(self.session_path):
+            try:
+                async with aiofiles.open(self.session_path, 'r') as f:
+                    session_string = await f.read()
+                session = StringSession(session_string.strip())
+            except Exception as e:
+                console.print(f"[yellow]⚠ Failed to load session file: {e}[/yellow]")
+                logger.warning(f"Failed to load {self.session_path}: {e}")
+        
         self.client = TelegramClient(
-            StringSession(),
+            session,
             config.API_ID,
             config.API_HASH,
             device_model=f"SessionManager-{platform.node()}",
             system_version=platform.system(),
-            app_version="5.1",
+            app_version=VERSION,
             connection_retries=config.MAX_RETRIES,
             retry_delay=config.RETRY_DELAY
         )
-        if os.path.exists(self.session_path):
-            try:
-                async with aiofiles.open(self.session_path, 'rb') as f:
-                    session_data = await f.read()
-                self.client.session.load(session_data.decode('utf-8', errors='replace'))
-            except Exception as e:
-                console.print(f"[yellow]⚠ Failed to load session file: {e}[/yellow]")
-                logger.warning(f"Failed to load {self.session_path}: {e}")
         
         for attempt in range(config.MAX_RETRIES):
             try:
@@ -227,7 +230,8 @@ class AdvancedTelegramClient:
     
     async def safe_execute(self, request: Any, *args, **kwargs) -> Any:
         if not self._connected:
-            await self.connect()
+            if not await self.connect():
+                return None
         for attempt in range(config.MAX_RETRIES):
             try:
                 if callable(request):
@@ -250,14 +254,16 @@ class AdvancedTelegramClient:
 
 def print_header(title: str) -> None:
     console.print(Panel(
-        f"[bold cyan]{title}[/bold cyan]",
+        Text(title, style="bold cyan", justify="center"),
         border_style="blue",
-        subtitle=f"v5.1 | Telethon {telethon_version}",
-        padding=(0, 2)
+        subtitle=f"v{VERSION} | Telethon {telethon_version}",
+        subtitle_align="right",
+        padding=(0, 2),
+        width=60
     ))
 
 def print_message(style: str, symbol: str, message: str):
-    console.print(f"[{style}]{symbol} {message}[/{style}]")
+    console.print(f"[{style}]{symbol}[/] {message}", width=60)
 
 def validate_phone(phone: str) -> bool:
     phone = phone.strip()
@@ -280,7 +286,8 @@ async def create_session() -> Optional[str]:
         if not Confirm.ask("[yellow]Overwrite existing session?[/yellow]"):
             return session_path
     
-    async with TelegramClient(StringSession(), config.API_ID, config.API_HASH) as client:
+    session = StringSession()
+    async with TelegramClient(session, config.API_ID, config.API_HASH) as client:
         try:
             with console.status("[cyan]Connecting to Telegram...", spinner="dots"):
                 await client.connect()
@@ -318,22 +325,15 @@ async def create_session() -> Optional[str]:
             async with db_connection() as conn:
                 conn.execute(
                     "INSERT OR REPLACE INTO sessions (phone, path, created_at, last_used, metadata, session_hash) VALUES (?, ?, ?, ?, ?, ?)",
-                    (phone, session_path, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat(), json.dumps(metadata), sha256(phone.encode()).hexdigest()[:16])
+                    (phone, session_path, datetime.now(timezone.utc).isoformat(), 
+                     datetime.now(timezone.utc okt).isoformat(), json.dumps(metadata), 
+                     sha256(phone.encode()).hexdigest()[:16])
                 )
             print_message("green", "✓", f"Session created for {me.first_name} {me.last_name or ''} ({phone})")
             logger.info(f"Session created for {phone}")
             return session_path
-        except PhoneNumberInvalidError:
-            print_message("red", "✗", "Invalid phone number")
-            return None
-        except FloodWaitError as e:
-            print_message("yellow", "⚠", f"Flood wait: {min(e.seconds, 3600)}s")
-            return None
-        except RPCError as e:
-            print_message("red", "✗", f"Telegram error: {e}")
-            return None
         except Exception as e:
-            print_message("red", "✗", f"Unexpected error: {e}")
+            print_message("red", "✗", f"Error: {e}")
             logger.error(f"Failed to create session for {phone}: {e}")
             return None
 
@@ -364,7 +364,9 @@ async def list_sessions(status_filter: str = "active") -> Optional[List[str]]:
                         }
                         cursor.execute(
                             "INSERT OR IGNORE INTO sessions (phone, path, created_at, last_used, metadata, session_hash) VALUES (?, ?, ?, ?, ?, ?)",
-                            (phone, session, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat(), json.dumps(metadata), client._generate_session_hash())
+                            (phone, session, datetime.now(timezone.utc).isoformat(), 
+                             datetime.now(timezone.utc).isoformat(), json.dumps(metadata), 
+                             client._generate_session_hash())
                         )
                         conn.commit()
                         print_message("green", "✓", f"Added manual session: {phone}")
@@ -372,13 +374,12 @@ async def list_sessions(status_filter: str = "active") -> Optional[List[str]]:
                     else:
                         print_message("yellow", "⚠", f"Unverified session: {phone}")
     
-    table = Table(title=f"[magenta]Sessions ({status_filter})[/magenta]", box=box.ROUNDED, border_style="blue")
-    table.add_column("#", style="cyan", width=3)
+    table = Table(title=f"[magenta]Sessions ({status_filter})[/magenta]", box=box.ROUNDED, border_style="blue", width=60)
+    table.add_column("#", style="cyan", width=4, justify="right")
     table.add_column("Phone", style="magenta", width=15)
-    table.add_column("Last Used", style="blue", width=20)
-    table.add_column("Username", style="cyan", width=15)
+    table.add_column("Last Used", style="blue", width=19)
+    table.add_column("Username", style="cyan", width=12)
     table.add_column("Status", style="green", width=10)
-    table.add_column("Hash", style="white", width=8)
     
     filtered_sessions = []
     for i, session in enumerate(sorted(sessions, key=os.path.getmtime, reverse=True), 1):
@@ -386,12 +387,12 @@ async def list_sessions(status_filter: str = "active") -> Optional[List[str]]:
         if phone in db_sessions:
             row = db_sessions[phone]
             last_used = row[2][:19] if row[2] else "Never"
-            metadata = json.loads(row[3])
+            metadata = json.loads(row[3] or '{}')
             status = "[green]Active[/green]" if row[5] == "active" else "[red]Inactive[/red]"
-            table.add_row(str(i), phone, last_used, metadata.get("username", "N/A"), status, row[4][:8] if row[4] else "N/A")
+            table.add_row(str(i), phone, last_used, metadata.get("username", "N/A"), status)
             filtered_sessions.append(session)
         else:
-            table.add_row(str(i), phone, "Pending", "N/A", "[yellow]Unverified[/yellow]", "N/A")
+            table.add_row(str(i), phone, "Pending", "N/A", "[yellow]Unverified[/yellow]")
             filtered_sessions.append(session)
     
     console.print(table)
@@ -431,13 +432,13 @@ async def terminate_other_sessions():
             print_message("blue", "ℹ", "No other active sessions found")
             return
         
-        table = Table(title="Other Sessions", box=box.ROUNDED, border_style="red")
-        table.add_column("Device", style="cyan")
-        table.add_column("IP", style="magenta")
-        table.add_column("Location", style="yellow")
-        table.add_column("Last Active", style="green")
+        table = Table(title="Other Sessions", box=box.ROUNDED, border_style="red", width=60)
+        table.add_column("Device", style="cyan", width=15)
+        table.add_column("IP", style="magenta", width=15)
+        table.add_column("Location", style="yellow", width=15)
+        table.add_column("Last Active", style="green", width=15)
         for auth in other_sessions:
-            table.add_row(auth.device_model, auth.ip, auth.country, auth.date_active.strftime('%Y-%m-%d %H:%M:%S'))
+            table.add_row(auth.device_model, auth.ip, auth.country, auth.date_active.strftime('%Y-%m-%d %H:%M'))
         console.print(table)
         
         if not Confirm.ask("[red]Terminate all other sessions?[/red]"):
@@ -461,14 +462,14 @@ async def show_active_sessions():
         return
     try:
         auths = await client.safe_execute(GetAuthorizationsRequest())
-        table = Table(title=f"Active Sessions ({len(auths.authorizations)})", box=box.ROUNDED, border_style="cyan")
-        table.add_column("Status", style="bold")
-        table.add_column("Device", style="cyan")
-        table.add_column("IP", style="magenta")
-        table.add_column("Last Active", style="green")
+        table = Table(title=f"Active Sessions ({len(auths.authorizations)})", box=box.ROUNDED, border_style="cyan", width=60)
+        table.add_column("Status", style="bold", width=10)
+        table.add_column("Device", style="cyan", width=15)
+        table.add_column("IP", style="magenta", width=15)
+        table.add_column("Last Active", style="green", width=20)
         for auth in auths.authorizations:
             status = "[green]Current[/green]" if auth.current else "[red]Other[/red]"
-            table.add_row(status, auth.device_model, auth.ip, auth.date_active.strftime('%Y-%m-%d %H:%M:%S'))
+            table.add_row(status, auth.device_model, auth.ip, auth.date_active.strftime('%Y-%m-%d %H:%M'))
         console.print(table)
     except Exception as e:
         print_message("red", "✗", f"Error: {e}")
@@ -504,9 +505,9 @@ async def clear_contacts():
             print_message("blue", "ℹ", "No contacts found")
             return
         
-        table = Table(title=f"Contacts ({len(contacts.contacts)})", box=box.ROUNDED, border_style="magenta")
-        table.add_column("Name", style="magenta")
-        table.add_column("Phone", style="green")
+        table = Table(title=f"Contacts ({len(contacts.contacts)})", box=box.ROUNDED, border_style="magenta", width=60)
+        table.add_column("Name", style="magenta", width=30)
+        table.add_column("Phone", style="green", width=30)
         for contact in contacts.contacts[:10]:
             user = next((u for u in contacts.users if u.id == contact.user_id), None)
             if user:
@@ -541,10 +542,10 @@ async def delete_all_chats_advanced():
             print_message("blue", "ℹ", "No chats or channels found")
             return
         
-        table = Table(title=f"Chats/Channels ({len(dialogs.dialogs)})", box=box.ROUNDED, border_style="yellow")
-        table.add_column("Type", style="cyan")
-        table.add_column("Title", style="magenta")
-        table.add_column("Members", style="white")
+        table = Table(title=f"Chats/Channels ({len(dialogs.dialogs)})", box=box.ROUNDED, border_style="yellow", width=60)
+        table.add_column("Type", style="cyan", width=15)
+        table.add_column("Title", style="magenta", width=30)
+        table.add_column("Members", style="white", width=15)
         for dialog in dialogs.dialogs[:10]:
             entity = dialog.entity
             chat_type = "Channel" if isinstance(entity, types.Channel) else "Chat"
@@ -588,9 +589,9 @@ async def check_spam_status():
         password_info = await client.safe_execute(GetPasswordRequest)
         has_2fa = "Yes" if password_info.has_password else "No"
         
-        table = Table(title="Account Status", box=box.ROUNDED, border_style="green")
-        table.add_column("Metric", style="cyan")
-        table.add_column("Value", style="magenta")
+        table = Table(title="Account Status", box=box.ROUNDED, border_style="green", width=60)
+        table.add_column("Metric", style="cyan", width=20)
+        table.add_column("Value", style="magenta", width=40)
         table.add_row("Account TTL", f"{ttl.days} days")
         table.add_row("Spam Status", status)
         table.add_row("2FA Enabled", has_2fa)
@@ -608,7 +609,7 @@ async def read_session_otp():
         messages = await client.safe_execute(client.client.get_messages, "Telegram", limit=20)
         otps = []
         for msg in messages:
-            if "login code" in msg.text.lower():
+            if msg and "login code" in msg.text.lower():
                 code = ''.join(filter(str.isdigit, msg.text))
                 if code:
                     otps.append((code, msg.date))
@@ -618,7 +619,8 @@ async def read_session_otp():
                 console.print(Panel(
                     f"OTP: [bold green]{code}[/bold green]\nReceived: {date.strftime('%Y-%m-%d %H:%M:%S')}",
                     title="Login Code",
-                    border_style="green"
+                    border_style="green",
+                    width=60
                 ))
                 logger.info(f"OTP found for {client.phone}: {code}")
         else:
@@ -635,7 +637,7 @@ async def manage_2fa():
     
     async def get_password_hash(password: str) -> bytes:
         password_info = await client.safe_execute(GetPasswordRequest)
-        if not password_info.current_algo:
+        if not password_info or not password_info.current_algo:
             return None
         return await asyncio.get_event_loop().run_in_executor(
             executor,
@@ -729,9 +731,9 @@ async def manage_2fa():
     async def check_2fa_status():
         try:
             password_info = await client.safe_execute(GetPasswordRequest)
-            table = Table(title="2FA Status", box=box.ROUNDED, border_style="cyan")
-            table.add_column("Property", style="cyan")
-            table.add_column("Value", style="magenta")
+            table = Table(title="2FA Status", box=box.ROUNDED, border_style="cyan", width=60)
+            table.add_column("Property", style="cyan", width=20)
+            table.add_column("Value", style="magenta", width=40)
             table.add_row("Enabled", "Yes" if password_info.has_password else "No")
             table.add_row("Hint", password_info.hint or "None")
             table.add_row("Email", "Set" if password_info.has_recovery else "Not set")
@@ -750,9 +752,9 @@ async def manage_2fa():
     
     while True:
         print_header("2FA Management Menu")
-        table = Table(box=box.ROUNDED, show_header=False, border_style="magenta")
-        table.add_column("Option", style="cyan", width=8)
-        table.add_column("Action", style="magenta")
+        table = Table(box=box.ROUNDED, show_header=False, border_style="magenta", width=60)
+        table.add_column("Option", style="cyan", width=10, justify="right")
+        table.add_column("Action", style="magenta", width=50)
         for num, (desc, _) in menu_options.items():
             table.add_row(num, desc)
         console.print(table)
@@ -799,9 +801,9 @@ async def session_statistics():
                 "Recently Used (24h)": cursor.execute("SELECT COUNT(*) FROM sessions WHERE last_used > ?", (datetime.now(timezone.utc).replace(hour=0, minute=0, second=0).isoformat(),)).fetchone()[0]
             }
         
-        table = Table(title="Session Statistics", box=box.ROUNDED, border_style="blue")
-        table.add_column("Metric", style="cyan")
-        table.add_column("Value", style="magenta")
+        table = Table(title="Session Statistics", box=box.ROUNDED, border_style="blue", width=60)
+        table.add_column("Metric", style="cyan", width=20)
+        table.add_column("Value", style="magenta", width=40)
         for metric, value in stats.items():
             table.add_row(metric, str(value))
         console.print(table)
@@ -851,9 +853,9 @@ async def cleanup_sessions():
         print_message("blue", "ℹ", "No orphaned sessions found")
         return
     
-    table = Table(title=f"Orphaned Sessions ({len(orphaned)})", box=box.ROUNDED, border_style="yellow")
-    table.add_column("File", style="yellow")
-    table.add_column("Size (KB)", style="white")
+    table = Table(title=f"Orphaned Sessions ({len(orphaned)})", box=box.ROUNDED, border_style="yellow", width=60)
+    table.add_column("File", style="yellow", width=40)
+    table.add_column("Size (KB)", style="white", width=20)
     for session in orphaned[:10]:
         size = os.path.getsize(session) / 1024
         table.add_row(os.path.basename(session), f"{size:.2f}")
@@ -897,10 +899,10 @@ async def bulk_session_check():
         results = await asyncio.gather(*[check_session(s) for s in sessions])
         progress.update(task, completed=len(sessions))
     
-    table = Table(title="Session Health", box=box.ROUNDED, border_style="cyan")
-    table.add_column("Phone", style="magenta")
-    table.add_column("Status", style="green")
-    table.add_column("Name", style="cyan")
+    table = Table(title="Session Health", box=box.ROUNDED, border_style="cyan", width=60)
+    table.add_column("Phone", style="magenta", width=15)
+    table.add_column("Status", style="green", width=25)
+    table.add_column("Name", style="cyan", width=20)
     for result in results:
         table.add_row(result["phone"], result["status"], result["name"])
     console.print(table)
@@ -947,9 +949,9 @@ async def view_session_notes():
         print_message("blue", "ℹ", "No notes found")
         return
     
-    table = Table(title="Session Notes", box=box.ROUNDED, border_style="blue")
-    table.add_column("Phone", style="magenta")
-    table.add_column("Note", style="white")
+    table = Table(title="Session Notes", box=box.ROUNDED, border_style="blue", width=60)
+    table.add_column("Phone", style="magenta", width=15)
+    table.add_column("Note", style="white", width=45)
     for phone, note in notes:
         table.add_row(phone, note)
     console.print(table)
@@ -984,7 +986,11 @@ def create_main_layout() -> Layout:
     layout.split_column(
         Layout(name="header", size=3),
         Layout(name="main", ratio=1),
-        Layout(name="footer", size=2)
+        Layout(name="footer", size=3)
+    )
+    layout["main"].split_row(
+        Layout(name="menu", ratio=1),
+        Layout(name="status", ratio=1)
     )
     return layout
 
@@ -1012,32 +1018,52 @@ async def main():
     }
     
     layout = create_main_layout()
+    status_messages = []
     
     async def update_header():
         async with db_connection() as conn:
             total_sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
         layout["header"].update(Panel(
-            f"[bold cyan]Telegram Advanced Session Manager[/bold cyan] | Sessions: {total_sessions}",
+            f"[bold cyan]Telegram Session Manager[/bold cyan] | Sessions: {total_sessions}",
             border_style="blue",
-            subtitle=f"v5.1 | Telethon {telethon_version}",
+            subtitle=f"v{VERSION} | Telethon {telethon_version}",
             subtitle_align="right"
         ))
     
     async def update_footer():
         layout["footer"].update(Panel(
-            f"[blue]Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Ctrl+C to Exit[/blue]",
+            f"[blue]Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"Ctrl+C to Exit | Log: logs/session_manager.log[/blue]",
             border_style="blue"
         ))
     
+    async def update_status():
+        status_table = Table(show=30, box=box.MINIMAL, show_header=False)
+        status_table.add_column("Status", style="white")
+        for msg in status_messages[-5:]:
+            status_table.add_row(msg)
+        layout["status"].update(Panel(status_table, title="Recent Activity", border_style="green"))
+
+    def add_status_message(style: str, message: str):
+        status_messages.append(f"[{style}]{message}[/{style}]")
+    
+    # Override print_message to update status
+    global print_message
+    def print_message(style: str, symbol: str, message: str):
+        full_message = f"{symbol} {message}"
+        console.print(f"[{style}]{full_message}[/{style}]", width=60)
+        add_status_message(style, full_message)
+
     while True:
         await update_header()
-        table = Table(box=box.ROUNDED, header_style="bold magenta", border_style="magenta")
-        table.add_column("Option", style="cyan", width=8, justify="right")
-        table.add_column("Action", style="magenta", width=25)
+        menu_table = Table(box=box.ROUNDED, header_style="bold magenta", border_style="magenta", width=30)
+        menu_table.add_column("Opt", style="cyan", width=5, justify="right")
+        menu_table.add_column("Action", style="magenta", width=25)
         for num, (action, _) in menu_options.items():
-            table.add_row(num, action)
-        layout["main"].update(table)
+            menu_table.add_row(num, action)
+        layout["menu"].update(menu_table)
         
+        await update_status()
         with Live(layout, console=console, refresh_per_second=1):
             await update_footer()
             choice = Prompt.ask("[cyan]Select option (1-19)[/cyan]", choices=list(menu_options.keys()))
@@ -1056,8 +1082,8 @@ if __name__ == "__main__":
         console.print("\n[red]✗ Operation cancelled[/red]")
         sys.exit(0)
     except Exception as e:
-        print_message("red", "✗", f"Fatal error: {e}")
         logger.error(f"Fatal error: {e}", exc_info=True)
+        console.print(f"[red]✗ Fatal error: {e}[/red]")
         sys.exit(1)
     finally:
         executor.shutdown(wait=False)
