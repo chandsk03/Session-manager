@@ -12,9 +12,7 @@ import aiofiles
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
-from cryptography.fernet import Fernet
 from hashlib import sha256
-import base64
 import logging
 from logging.handlers import RotatingFileHandler
 import threading
@@ -95,9 +93,8 @@ class SecureConfig:
         self.API_ID = self._get_env_int("TELEGRAM_API_ID", "23077946")
         self.API_HASH = self._get_env("TELEGRAM_API_HASH", "b6c2b715121435d4aa285c1fb2bc2220")
         self.SESSION_FOLDER = Path("sessions")
-        self.ENCRYPTION_KEY = self._get_encryption_key()
         self.MAX_RETRIES = self._get_env_int("MAX_RETRIES", "5")
-        self.RETRY_DELAY = self._get_env_int("RETRY_DELAY", "2")
+        self.RETRY_DELAY = self._get_env_int("RETRY_DELAY", "5")
         self.DB_PATH = Path("sessions.db")
         self.TELETHON_VERSION = version('telethon')
         self.BATCH_SIZE = self._get_env_int("BATCH_SIZE", "100")
@@ -115,20 +112,6 @@ class SecureConfig:
             console.print(f"[bold red]✗ Invalid value for {var}, using default: {default}[/bold red]")
             logger.warning(f"Invalid value for {var}, using default: {default}")
             return int(default)
-    
-    def _get_encryption_key(self) -> Optional[bytes]:
-        key = os.getenv("SESSION_ENCRYPTION_KEY")
-        if not key:
-            key = base64.urlsafe_b64encode(os.urandom(32)).decode()
-            console.print(f"[bold yellow]⚠ Generated new encryption key: {key}[/bold yellow]")
-            console.print(f"[bold yellow]⚐ Set this as SESSION_ENCRYPTION_KEY in your environment[/bold yellow]")
-            logger.info(f"Generated new encryption key: {key}")
-        try:
-            return base64.urlsafe_b64decode(key.encode())
-        except Exception as e:
-            console.print(f"[bold red]✗ Invalid encryption key format: {str(e)} - sessions won't be encrypted[/bold red]")
-            logger.error(f"Invalid encryption key format: {str(e)}")
-            return None
     
     def _setup_folders(self):
         self.SESSION_FOLDER.mkdir(exist_ok=True)
@@ -171,7 +154,6 @@ class SecureConfig:
                     path TEXT,
                     created_at TEXT,
                     last_used TEXT,
-                    encrypted INTEGER DEFAULT 0,
                     metadata TEXT,
                     session_hash TEXT,
                     status TEXT DEFAULT 'active'
@@ -183,74 +165,15 @@ class SecureConfig:
 
 config = SecureConfig()
 
-class SessionSecurity:
-    _cipher_cache: Dict[bytes, Fernet] = {}
-    _lock = asyncio.Lock()
-
-    @classmethod
-    async def encrypt_session(cls, session_path: str, phone: str) -> None:
-        if not config.ENCRYPTION_KEY:
-            return
-        async with cls._lock:
-            try:
-                cipher = cls._get_cipher()
-                async with aiofiles.open(session_path, 'rb') as f:
-                    data = await f.read()
-                
-                encrypted_path = f"{session_path}.enc"
-                encrypted = await asyncio.get_event_loop().run_in_executor(executor, cipher.encrypt, data)
-                async with aiofiles.open(encrypted_path, 'wb') as f:
-                    await f.write(encrypted)
-                
-                os.remove(session_path)
-                async with cls.db_connection() as conn:
-                    conn.execute("UPDATE sessions SET encrypted = 1, path = ? WHERE phone = ?", (encrypted_path, phone))
-                console.print("[bold green]✓ Session encrypted successfully[/bold green]")
-                logger.info(f"Session encrypted: {session_path}")
-            except Exception as e:
-                console.print(f"[bold red]✗ Encryption failed: {str(e)}[/bold red]")
-                logger.error(f"Encryption failed for {session_path}: {str(e)}", exc_info=True)
-
-    @classmethod
-    async def decrypt_session(cls, session_path: str, phone: str) -> Optional[str]:
-        if not session_path.endswith('.enc') or not config.ENCRYPTION_KEY:
-            return session_path
-        async with cls._lock:
-            try:
-                cipher = cls._get_cipher()
-                async with aiofiles.open(session_path, 'rb') as f:
-                    encrypted = await f.read()
-                
-                decrypted = await asyncio.get_event_loop().run_in_executor(executor, cipher.decrypt, encrypted)
-                clean_path = session_path[:-4]
-                async with aiofiles.open(clean_path, 'wb') as f:
-                    await f.write(decrypted)
-                os.chmod(clean_path, 0o664)
-                async with cls.db_connection() as conn:
-                    conn.execute("UPDATE sessions SET encrypted = 0, path = ? WHERE phone = ?", (clean_path, phone))
-                logger.info(f"Session decrypted: {session_path}")
-                return clean_path
-            except Exception as e:
-                console.print(f"[bold red]✗ Decryption failed: {str(e)}[/bold red]")
-                logger.error(f"Decryption failed for {session_path}: {str(e)}", exc_info=True)
-                return None
-
-    @classmethod
-    def _get_cipher(cls) -> Fernet:
-        if config.ENCRYPTION_KEY not in cls._cipher_cache:
-            cls._cipher_cache[config.ENCRYPTION_KEY] = Fernet(base64.urlsafe_b64encode(config.ENCRYPTION_KEY))
-        return cls._cipher_cache[config.ENCRYPTION_KEY]
-
-    @classmethod
-    @asynccontextmanager
-    async def db_connection(cls):
-        conn = sqlite3.connect(config.DB_PATH, timeout=20)
-        conn.execute("PRAGMA busy_timeout = 20000")
-        try:
-            yield conn
-        finally:
-            conn.commit()
-            conn.close()
+@asynccontextmanager
+async def db_connection():
+    conn = sqlite3.connect(config.DB_PATH, timeout=20)
+    conn.execute("PRAGMA busy_timeout = 20000")
+    try:
+        yield conn
+    finally:
+        conn.commit()
+        conn.close()
 
 class AdvancedTelegramClient:
     def __init__(self, session_path: str, phone: str):
@@ -269,10 +192,6 @@ class AdvancedTelegramClient:
         
     async def connect(self) -> bool:
         async with self._semaphore:
-            decrypted_path = await SessionSecurity.decrypt_session(self.session_path, self.phone)
-            if not decrypted_path:
-                return False
-                
             client_params = {
                 'session': StringSession(),
                 'api_id': config.API_ID,
@@ -281,43 +200,51 @@ class AdvancedTelegramClient:
                 'system_version': platform.platform(),
                 'app_version': "5.1",
                 'lang_code': "en",
-                'system_lang_code': "en-US"
+                'system_lang_code': "en-US",
+                'connection_retries': config.MAX_RETRIES,
+                'retry_delay': config.RETRY_DELAY,
+                'auto_reconnect': True,
+                'flood_sleep_threshold': 60
             }
             
-            if config.TELETHON_VERSION >= '1.24.0':
-                client_params.update({
-                    'request_retries': config.MAX_RETRIES,
-                    'connection_retries': config.MAX_RETRIES,
-                    'auto_reconnect': True,
-                    'flood_sleep_threshold': 60
-                })
-            
             self.client = TelegramClient(**client_params)
-            if os.path.exists(decrypted_path):
-                os.chmod(decrypted_path, 0o664)
-                async with aiofiles.open(decrypted_path, 'r') as f:
-                    session_string = await f.read()
-                self.client.session.load(session_string)
+            if os.path.exists(self.session_path):
+                try:
+                    os.chmod(self.session_path, 0o664)
+                    async with aiofiles.open(self.session_path, 'r') as f:
+                        session_string = await f.read()
+                    self.client.session.load(session_string)
+                except Exception as e:
+                    console.print(f"[bold yellow]⚠ Failed to load session file: {str(e)}[/bold yellow]")
+                    logger.warning(f"Failed to load session {self.session_path}: {str(e)}")
             
-            try:
-                with console.status("[bold cyan]Connecting to Telegram...", spinner="dots") as status:
-                    await self.client.connect()
-                    if not await self.client.is_user_authorized():
-                        console.print("[bold red]✗ Session not authorized[/bold red]")
-                        return False
-                    self._me = await self.client.get_me()
-                    console.print(f"[bold green]✓ Connected as {self._me.first_name} (ID: {self._me.id})[/bold green]")
-                    async with SessionSecurity.db_connection() as conn:
-                        conn.execute(
-                            "UPDATE sessions SET last_used = ?, session_hash = ? WHERE phone = ?",
-                            (datetime.now(timezone.utc).isoformat(), self._generate_session_hash(), self.phone)
-                        )
-                    logger.info(f"Connected to session: {self.phone}")
-                    return True
-            except Exception as e:
-                console.print(f"[bold red]✗ Connection failed: {str(e)}[/bold red]")
-                logger.error(f"Connection failed for {self.session_path}: {str(e)}", exc_info=True)
-                return False
+            for attempt in range(config.MAX_RETRIES):
+                try:
+                    with console.status("[bold cyan]Connecting to Telegram...", spinner="dots") as status:
+                        await self.client.connect()
+                        if not await self.client.is_user_authorized():
+                            console.print("[bold red]✗ Session not authorized[/bold red]")
+                            return False
+                        self._me = await self.client.get_me()
+                        console.print(f"[bold green]✓ Connected as {self._me.first_name} (ID: {self._me.id})[/bold green]")
+                        async with db_connection() as conn:
+                            conn.execute(
+                                "UPDATE sessions SET last_used = ?, session_hash = ? WHERE phone = ?",
+                                (datetime.now(timezone.utc).isoformat(), self._generate_session_hash(), self.phone)
+                            )
+                        logger.info(f"Connected to session: {self.phone}")
+                        return True
+                except (TimeoutError, ConnectionError) as e:
+                    console.print(f"[bold yellow]⚠ Connection attempt {attempt+1}/{config.MAX_RETRIES} failed: {str(e)}[/bold yellow]")
+                    logger.warning(f"Connection attempt {attempt+1} failed: {str(e)}")
+                    if attempt < config.MAX_RETRIES - 1:
+                        await asyncio.sleep(config.RETRY_DELAY * (2 ** attempt))
+                except Exception as e:
+                    console.print(f"[bold red]✗ Connection failed: {str(e)}[/bold red]")
+                    logger.error(f"Connection failed for {self.session_path}: {str(e)}", exc_info=True)
+                    return False
+            console.print(f"[bold red]✗ Failed to connect after {config.MAX_RETRIES} attempts[/bold red]")
+            return False
     
     async def disconnect(self):
         if self.client and self.client.is_connected():
@@ -389,92 +316,124 @@ async def create_session() -> Optional[str]:
         return None
     
     session_path = str(config.SESSION_FOLDER / f"{phone[1:]}.session")
-    if os.path.exists(session_path) or os.path.exists(session_path + '.enc'):
+    if os.path.exists(session_path):
         print_warning(f"Session already exists for {phone}")
         return session_path
     
     async with AdvancedTelegramClient(session_path, phone) as client:
         if not await client.connect():
             async with TelegramClient(StringSession(), config.API_ID, config.API_HASH) as temp_client:
-                try:
-                    print_info(f"Sending code to {phone}...")
-                    await temp_client.send_code_request(phone)
-                    code = Prompt.ask("[bold yellow]Enter code (or 'q' to quit)[/bold yellow]", default="q")
-                    if code.lower() == 'q':
-                        return None
+                for attempt in range(config.MAX_RETRIES):
                     try:
-                        await temp_client.sign_in(phone, code)
-                    except SessionPasswordNeededError:
-                        password = getpass.getpass("[bold red]Enter 2FA password: [/bold red]")
-                        await temp_client.sign_in(password=password)
-                    
-                    me = await temp_client.get_me()
-                    metadata = {
-                        "username": me.username,
-                        "first_name": me.first_name,
-                        "last_name": me.last_name,
-                        "premium": me.premium,
-                        "language": me.lang_code
-                    }
-                    session_string = temp_client.session.save()
-                    async with aiofiles.open(session_path, 'w') as f:
-                        await f.write(session_string)
-                    os.chmod(session_path, 0o664)
-                    async with SessionSecurity.db_connection() as conn:
-                        conn.execute(
-                            "INSERT OR REPLACE INTO sessions (phone, path, created_at, last_used, metadata, session_hash) VALUES (?, ?, ?, ?, ?, ?)",
-                            (phone, session_path, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat(), json.dumps(metadata), client._generate_session_hash())
-                        )
-                    await SessionSecurity.encrypt_session(session_path, phone)
-                    print_success(f"Session created for {me.first_name} {me.last_name or ''} ({me.phone})")
-                    logger.info(f"New session created for {phone}")
-                    return session_path
-                except RPCError as e:
-                    if "ResendCodeRequest" in str(e):
-                        print_warning("Telegram verification limit reached. Please wait and try again later.")
-                    else:
-                        print_error(f"Failed to create session: {str(e)}")
-                    if os.path.exists(session_path):
-                        os.remove(session_path)
-                    return None
+                        print_info(f"Sending code to {phone}...")
+                        await temp_client.connect()
+                        await temp_client.send_code_request(phone)
+                        code = Prompt.ask("[bold yellow]Enter code (or 'q' to quit)[/bold yellow]", default="q")
+                        if code.lower() == 'q':
+                            return None
+                        try:
+                            await temp_client.sign_in(phone, code)
+                        except SessionPasswordNeededError:
+                            password = getpass.getpass("[bold red]Enter 2FA password: [/bold red]")
+                            await temp_client.sign_in(password=password)
+                        
+                        me = await temp_client.get_me()
+                        metadata = {
+                            "username": me.username,
+                            "first_name": me.first_name,
+                            "last_name": me.last_name,
+                            "premium": me.premium,
+                            "language": me.lang_code
+                        }
+                        session_string = temp_client.session.save()
+                        async with aiofiles.open(session_path, 'w') as f:
+                            await f.write(session_string)
+                        os.chmod(session_path, 0o664)
+                        async with db_connection() as conn:
+                            conn.execute(
+                                "INSERT OR REPLACE INTO sessions (phone, path, created_at, last_used, metadata, session_hash) VALUES (?, ?, ?, ?, ?, ?)",
+                                (phone, session_path, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat(), json.dumps(metadata), client._generate_session_hash())
+                            )
+                        print_success(f"Session created for {me.first_name} {me.last_name or ''} ({me.phone})")
+                        logger.info(f"New session created for {phone}")
+                        return session_path
+                    except RPCError as e:
+                        if "FLOOD_WAIT" in str(e):
+                            wait = int(str(e).split()[1]) if str(e).split()[1].isdigit() else 300
+                            console.print(f"[bold yellow]⚠ Flood wait required: {wait}s. Retrying after delay...[/bold yellow]")
+                            await asyncio.sleep(wait)
+                        elif "ResendCodeRequest" in str(e):
+                            console.print("[bold yellow]⚠ Telegram verification limit reached. Please wait and try again later.[/bold yellow]")
+                            return None
+                        else:
+                            print_error(f"Failed to create session: {str(e)}")
+                            return None
+                    except Exception as e:
+                        print_error(f"Attempt {attempt+1} failed: {str(e)}")
+                        if attempt < config.MAX_RETRIES - 1:
+                            await asyncio.sleep(config.RETRY_DELAY * (2 ** attempt))
+                        else:
+                            print_error(f"Failed to create session after {config.MAX_RETRIES} attempts")
+                            return None
         return session_path
 
-async def list_sessions(country_code: Optional[str] = None, status_filter: str = "active") -> Optional[List[str]]:
-    sessions = [str(p) for p in config.SESSION_FOLDER.glob("*.session*")]
-    if country_code:
-        country_code = country_code.replace('+', '')
-        sessions = [s for s in sessions if os.path.basename(s).startswith(country_code)]
-    
+async def list_sessions(status_filter: str = "active") -> Optional[List[str]]:
+    sessions = [str(p) for p in config.SESSION_FOLDER.glob("*.session")]
     if not sessions:
         print_warning("No saved sessions found")
         return None
+    
+    # Auto-detect and validate manually added sessions
+    async with db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT phone, path FROM sessions")
+        known_sessions = {row[1]: row[0] for row in cursor.fetchall()}
+        
+        for session in sessions:
+            if session not in known_sessions:
+                phone = f"+{os.path.basename(session).replace('.session', '')}"
+                async with AdvancedTelegramClient(session, phone) as client:
+                    if await client.connect():
+                        me = await client._me
+                        metadata = {
+                            "username": me.username,
+                            "first_name": me.first_name,
+                            "last_name": me.last_name,
+                            "premium": me.premium,
+                            "language": me.lang_code
+                        }
+                        cursor.execute(
+                            "INSERT OR REPLACE INTO sessions (phone, path, created_at, last_used, metadata, session_hash) VALUES (?, ?, ?, ?, ?, ?)",
+                            (phone, session, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat(), json.dumps(metadata), client._generate_session_hash())
+                        )
+                        conn.commit()
+                        print_success(f"Added manually detected session: {phone}")
+                        logger.info(f"Manually detected and added session: {phone}")
     
     table = Table(title=f"Available Sessions ({status_filter})", box=box.ROUNDED, header_style="bold magenta")
     table.add_column("#", style="cyan", justify="right")
     table.add_column("Phone", style="magenta")
     table.add_column("File", style="yellow")
-    table.add_column("Status", style="green")
     table.add_column("Last Used", style="blue")
     table.add_column("Username", style="cyan")
     table.add_column("Hash", style="white")
     
     filtered_sessions = []
-    async with SessionSecurity.db_connection() as conn:
+    async with db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT phone, path, last_used, metadata, session_hash, status FROM sessions WHERE status = ?", (status_filter,))
         db_sessions = {row[0]: row for row in cursor.fetchall()}
         
         for i, session in enumerate(sorted(sessions, key=os.path.getmtime, reverse=True), 1):
-            session_name = os.path.basename(session).replace('.session', '').replace('.enc', '')
+            session_name = os.path.basename(session).replace('.session', '')
             phone = f"+{session_name}"
             if phone in db_sessions:
                 row = db_sessions[phone]
-                status = "🔒 Encrypted" if session.endswith('.enc') else "🔓 Normal"
                 last_used = row[2] if row[2] else "Never"
                 metadata = json.loads(row[3]) if row[3] else {}
                 username = metadata.get("username", "N/A")
                 session_hash = row[4][:8] if row[4] else "N/A"
-                table.add_row(str(i), phone, os.path.basename(session), status, last_used, username, session_hash)
+                table.add_row(str(i), phone, os.path.basename(session), last_used, username, session_hash)
                 filtered_sessions.append(session)
     
     console.print(table)
@@ -492,7 +451,7 @@ async def select_and_login() -> Optional['AdvancedTelegramClient']:
         try:
             choice = int(choice) - 1
             if 0 <= choice < len(sessions):
-                phone = f"+{os.path.basename(sessions[choice]).replace('.session', '').replace('.enc', '')}"
+                phone = f"+{os.path.basename(sessions[choice]).replace('.session', '')}"
                 client = AdvancedTelegramClient(sessions[choice], phone)
                 if await client.connect():
                     return client
@@ -735,24 +694,6 @@ async def read_session_otp() -> None:
         print_error(f"Failed to read OTP: {str(e)}")
         logger.error(f"Failed to read OTP: {str(e)}", exc_info=True)
 
-async def get_random_session_by_country() -> None:
-    print_header("Random Session by Country")
-    country_code = Prompt.ask("[bold cyan]Enter country code (e.g., +91)[/bold cyan]", default="+91")
-    if not country_code.startswith('+'):
-        print_error("Country code must start with '+'")
-        return
-    
-    sessions = await list_sessions(country_code)
-    if not sessions:
-        return
-    session = random.choice(sessions)
-    phone = f"+{os.path.basename(session).replace('.session', '').replace('.enc', '')}"
-    async with AdvancedTelegramClient(session, phone) as client:
-        if await client.connect():
-            me = await client.client.get_me()
-            print_success(f"Selected and logged into: {me.first_name} ({phone}) - {os.path.basename(session)}")
-            logger.info(f"Random session selected and logged in: {session}")
-
 async def manage_2fa() -> None:
     print_header("2FA Management")
     client = await select_and_login()
@@ -886,17 +827,17 @@ async def export_sessions() -> None:
         return
     
     try:
-        async with SessionSecurity.db_connection() as conn:
+        async with db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT phone, path, created_at, last_used, encrypted, metadata, session_hash, status FROM sessions")
+            cursor.execute("SELECT phone, path, created_at, last_used, metadata, session_hash, status FROM sessions")
             data = cursor.fetchall()
         
         export_path = f"sessions_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         async with aiofiles.open(export_path, 'w', newline='') as f:
-            await f.write("Phone,Path,Created At,Last Used,Encrypted,Metadata,Session Hash,Status\n")
+            await f.write("Phone,Path,Created At,Last Used,Metadata,Session Hash,Status\n")
             for row in data:
-                metadata = json.dumps(json.loads(row[5]) if row[5] else {})
-                await f.write(f"{row[0]},{row[1]},{row[2]},{row[3]},{row[4]},{metadata},{row[6]},{row[7]}\n")
+                metadata = json.dumps(json.loads(row[4]) if row[4] else {})
+                await f.write(f"{row[0]},{row[1]},{row[2]},{row[3]},{metadata},{row[5]},{row[6]}\n")
         
         print_success(f"Exported {len(data)} sessions to {export_path}")
         logger.info(f"Exported {len(data)} sessions to {export_path}")
@@ -907,12 +848,11 @@ async def export_sessions() -> None:
 async def session_statistics() -> None:
     print_header("Session Statistics")
     try:
-        async with SessionSecurity.db_connection() as conn:
+        async with db_connection() as conn:
             cursor = conn.cursor()
             stats = {
                 "Total Sessions": cursor.execute("SELECT COUNT(*) FROM sessions").fetchone()[0],
                 "Active Sessions": cursor.execute("SELECT COUNT(*) FROM sessions WHERE status = 'active'").fetchone()[0],
-                "Encrypted Sessions": cursor.execute("SELECT COUNT(*) FROM sessions WHERE encrypted = 1").fetchone()[0],
                 "Premium Accounts": cursor.execute("SELECT COUNT(*) FROM sessions WHERE json_extract(metadata, '$.premium') = 1").fetchone()[0],
                 "Recently Used": cursor.execute("SELECT COUNT(*) FROM sessions WHERE last_used > ?", (datetime.now(timezone.utc).isoformat(timespec='hours'),)).fetchone()[0]
             }
@@ -958,13 +898,13 @@ async def backup_sessions() -> None:
 
 async def cleanup_sessions() -> None:
     print_header("Cleanup Sessions")
-    sessions = [str(p) for p in config.SESSION_FOLDER.glob("*.session*")]
+    sessions = [str(p) for p in config.SESSION_FOLDER.glob("*.session")]
     
     if not sessions:
         print_info("No sessions to clean")
         return
     
-    async with SessionSecurity.db_connection() as conn:
+    async with db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT path FROM sessions WHERE status = 'active'")
         db_paths = set(row[0] for row in cursor.fetchall())
@@ -1003,7 +943,7 @@ async def bulk_session_check() -> None:
         return
     
     async def check_session(session: str) -> Dict[str, Any]:
-        phone = f"+{os.path.basename(session).replace('.session', '').replace('.enc', '')}"
+        phone = f"+{os.path.basename(session).replace('.session', '')}"
         async with AdvancedTelegramClient(session, phone) as client:
             try:
                 connected = await client.connect()
@@ -1029,7 +969,7 @@ async def bulk_session_check() -> None:
     
     unhealthy = [r["phone"] for r in results if "Healthy" not in r["status"]]
     if unhealthy and Confirm.ask("[bold yellow]Mark unhealthy sessions as inactive?[/bold yellow]"):
-        async with SessionSecurity.db_connection() as conn:
+        async with db_connection() as conn:
             conn.executemany("UPDATE sessions SET status = 'inactive' WHERE phone = ?", [(p,) for p in unhealthy])
         print_success(f"Marked {len(unhealthy)} sessions as inactive")
         logger.info(f"Marked {len(unhealthy)} sessions as inactive")
@@ -1045,14 +985,13 @@ async def main() -> None:
         "7": ("Advanced Chat Deletion", delete_all_chats_advanced),
         "8": ("Check Spam Status", check_spam_status),
         "9": ("Read OTP", read_session_otp),
-        "10": ("Random Session by Country", get_random_session_by_country),
-        "11": ("2FA Management", manage_2fa),
-        "12": ("Export Sessions", export_sessions),
-        "13": ("Session Statistics", session_statistics),
-        "14": ("Backup Sessions", backup_sessions),
-        "15": ("Cleanup Sessions", cleanup_sessions),
-        "16": ("Bulk Session Check", bulk_session_check),
-        "17": ("Exit", lambda: None)
+        "10": ("2FA Management", manage_2fa),
+        "11": ("Export Sessions", export_sessions),
+        "12": ("Session Statistics", session_statistics),
+        "13": ("Backup Sessions", backup_sessions),
+        "14": ("Cleanup Sessions", cleanup_sessions),
+        "15": ("Bulk Session Check", bulk_session_check),
+        "16": ("Exit", lambda: None)
     }
     
     while True:
@@ -1064,8 +1003,8 @@ async def main() -> None:
             table.add_row(num, desc)
         console.print(table)
         
-        choice = Prompt.ask("[bold cyan]Select option (1-17)[/bold cyan]", choices=list(menu_options.keys()))
-        if choice == "17":
+        choice = Prompt.ask("[bold cyan]Select option (1-16)[/bold cyan]", choices=list(menu_options.keys()))
+        if choice == "16":
             print_success("Goodbye!")
             break
         await menu_options[choice][1]()
