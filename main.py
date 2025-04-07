@@ -16,6 +16,7 @@ from cryptography.fernet import Fernet
 from hashlib import sha256
 import base64
 import logging
+from logging.handlers import RotatingFileHandler
 import threading
 from importlib.metadata import version
 from pathlib import Path
@@ -60,14 +61,13 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s - [%(filename)s:%(lineno)d] - Thread: %(threadName)s',
     handlers=[
-        logging.handlers.RotatingFileHandler('logs/session_manager.log', maxBytes=10*1024*1024, backupCount=10),
+        RotatingFileHandler('logs/session_manager.log', maxBytes=10*1024*1024, backupCount=10),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
-# Adjust terminal handler to show only errors
 for handler in logger.handlers:
-    if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+    if isinstance(handler, logging.StreamHandler) and not isinstance(handler, RotatingFileHandler):
         handler.setLevel(logging.ERROR)
 
 class Theme:
@@ -273,9 +273,8 @@ class AdvancedTelegramClient:
             if not decrypted_path:
                 return False
                 
-            os.chmod(decrypted_path, 0o664)
             client_params = {
-                'session': StringSession(),  # Use StringSession instead of file-based SQLite
+                'session': StringSession(),
                 'api_id': config.API_ID,
                 'api_hash': config.API_HASH,
                 'device_model': f"SessionManager-{platform.node()}",
@@ -295,6 +294,7 @@ class AdvancedTelegramClient:
             
             self.client = TelegramClient(**client_params)
             if os.path.exists(decrypted_path):
+                os.chmod(decrypted_path, 0o664)
                 async with aiofiles.open(decrypted_path, 'r') as f:
                     session_string = await f.read()
                 self.client.session.load(session_string)
@@ -401,8 +401,6 @@ async def create_session() -> Optional[str]:
                     await temp_client.send_code_request(phone)
                     code = Prompt.ask("[bold yellow]Enter code (or 'q' to quit)[/bold yellow]", default="q")
                     if code.lower() == 'q':
-                        if os.path.exists(session_path):
-                            os.remove(session_path)
                         return None
                     try:
                         await temp_client.sign_in(phone, code)
