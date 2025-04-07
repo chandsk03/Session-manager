@@ -326,7 +326,7 @@ async def create_session() -> Optional[str]:
                 conn.execute(
                     "INSERT OR REPLACE INTO sessions (phone, path, created_at, last_used, metadata, session_hash) VALUES (?, ?, ?, ?, ?, ?)",
                     (phone, session_path, datetime.now(timezone.utc).isoformat(), 
-                     datetime.now(timezone.utc).isoformat(), json.dumps(metadata)
+                     datetime.now(timezone.utc).isoformat(), json.dumps(metadata),
                      sha256(phone.encode()).hexdigest()[:16])
                 )
             print_message("green", "✓", f"Session created for {me.first_name} {me.last_name or ''} ({phone})")
