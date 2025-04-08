@@ -52,7 +52,7 @@ from rich.text import Text
 # Initialize
 console = Console()
 executor = ThreadPoolExecutor(max_workers=4)
-VERSION = "5.5"
+VERSION = "5.6"
 
 # Configure logging
 if not os.path.exists('logs'):
@@ -141,7 +141,6 @@ class SecureConfig:
     async def get_available_api(self) -> Dict[str, Any]:
         for api in self.API_POOL:
             if api["limits"]["count"] < 100 or (api["limits"]["last_used"] and (datetime.now(timezone.utc) - api["limits"]["last_used"]).total_seconds() > 3600):
-                # Reset count if an hour has passed since last use
                 if api["limits"]["last_used"] and (datetime.now(timezone.utc) - api["limits"]["last_used"]).total_seconds() > 3600:
                     api["limits"]["count"] = 0
                 api["limits"]["last_used"] = datetime.now(timezone.utc)
@@ -292,7 +291,7 @@ async def create_session() -> Optional[str]:
         if phone.lower() == 'q':
             return None
         if not validate_phone(phone):
-            print_message("red", "✗", "Invalid format. Use + followed by 9-14 digits")
+            print_message("red", "✗", "Invalid format. Use + followed by 10-14 digits")
             continue
         break
     
@@ -311,7 +310,7 @@ async def create_session() -> Optional[str]:
             print_message("blue", "ℹ", f"Sending code to {phone}")
             sent_code = await client.send_code_request(phone)
             for attempt in range(3):
-                code = Prompt.ask("[yellow]Enter code received ('q' to quit, 'r' to resend)[/yellow]", default="q")
+                code = Prompt.ask("[yellow]Enter the code you received ('q' to quit, 'r' to resend)[/yellow]")
                 if code.lower() == 'q':
                     return None
                 elif code.lower() == 'r':
@@ -322,6 +321,8 @@ async def create_session() -> Optional[str]:
                     except RPCError as e:
                         print_message("red", "✗", f"Failed to resend code: {e}")
                         logger.error(f"Failed to resend code for {phone}: {e}")
+                        if "all available options" in str(e).lower():
+                            print_message("yellow", "⚠", "All code delivery options exhausted. Wait 5-10 minutes and try again.")
                         return None
                 try:
                     await client.sign_in(phone, code, phone_code_hash=sent_code.phone_code_hash)
@@ -357,17 +358,19 @@ async def create_session() -> Optional[str]:
             os.chmod(session_path, 0o600)
             async with db_connection() as conn:
                 conn.execute(
-                    "INSERT OR REPLACE INTO sessions (phone, path, created_at, last_used, metadata, session_hash) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO sessions (phone, path, created_at, last_used, metadata, session_hash, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (phone, session_path, datetime.now(timezone.utc).isoformat(), 
                      datetime.now(timezone.utc).isoformat(), json.dumps(metadata), 
-                     sha256(phone.encode()).hexdigest()[:16])
+                     sha256(phone.encode()).hexdigest()[:16], "active")
                 )
-            print_message("green", "✓", f"Session created for {me.first_name} {me.last_name or ''} ({phone})")
+            print_message("green", "✓", f"Signed in successfully as {me.first_name} 💻; remember to not break the ToS or you will risk an account ban!")
             logger.info(f"Session created for {phone} with API {api['API_ID']}")
             return session_path
         except RPCError as e:
             print_message("red", "✗", f"Telegram error: {e}")
             logger.error(f"Telegram error for {phone}: {e}")
+            if "all available options" in str(e).lower():
+                print_message("yellow", "⚠", "All code delivery options exhausted. Wait 5-10 minutes and try again.")
             return None
         except Exception as e:
             print_message("red", "✗", f"Unexpected error: {e}")
@@ -400,16 +403,22 @@ async def list_sessions(status_filter: str = "active") -> Optional[List[str]]:
                             "id": str(me.id)
                         }
                         cursor.execute(
-                            "INSERT OR IGNORE INTO sessions (phone, path, created_at, last_used, metadata, session_hash) VALUES (?, ?, ?, ?, ?, ?)",
+                            "INSERT OR IGNORE INTO sessions (phone, path, created_at, last_used, metadata, session_hash, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
                             (phone, session, datetime.now(timezone.utc).isoformat(), 
                              datetime.now(timezone.utc).isoformat(), json.dumps(metadata), 
-                             client._generate_session_hash())
+                             client._generate_session_hash(), "active")
                         )
                         conn.commit()
                         print_message("green", "✓", f"Added manual session: {phone}")
                         logger.info(f"Added manual session: {phone}")
                     else:
                         print_message("yellow", "⚠", f"Unverified session: {phone}")
+                        cursor.execute(
+                            "INSERT OR IGNORE INTO sessions (phone, path, created_at, last_used, metadata, session_hash, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (phone, session, datetime.now(timezone.utc).isoformat(), None, '{}', 
+                             sha256(phone.encode()).hexdigest()[:16], "inactive")
+                        )
+                        conn.commit()
     
     table = Table(title=f"[magenta]Sessions ({status_filter})[/magenta]", box=box.ROUNDED, border_style="blue", width=60)
     table.add_column("#", style="cyan", width=4, justify="right")
@@ -522,7 +531,7 @@ async def update_profile_random_name():
         old_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
         adjectives = ["Cyber", "Quantum", "Neon", "Stealth", "Vortex"]
         nouns = ["Hacker", "Sentinel", "Phantom", "Rogue", "Titan"]
-        new_name = f"{adjectives[0]}{nouns[0]}{random.randint(1000, 9999)}"  # Simplified for predictability
+        new_name = f"{adjectives[0]}{nouns[0]}{random.randint(1000, 9999)}"
         about = Prompt.ask("[cyan]New about text (Enter to skip)[/cyan]", default="")
         await client.safe_execute(UpdateProfileRequest, first_name=new_name, about=about or None)
         print_message("green", "✓", f"Updated from '{old_name}' to '{new_name}'")
@@ -1059,9 +1068,9 @@ async def main():
     
     async def update_header():
         async with db_connection() as conn:
-            total_sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+            total_sessions = conn.execute("SELECT COUNT(*) FROM sessions WHERE status = 'active'").fetchone()[0]
         layout["header"].update(Panel(
-            f"[bold cyan]Telegram Session Manager[/bold cyan] | Sessions: {total_sessions}",
+            f"[bold cyan]Telegram Session Manager[/bold cyan] | Active Sessions: {total_sessions}",
             border_style="blue",
             subtitle=f"v{VERSION} | Telethon {telethon_version}",
             subtitle_align="right"
