@@ -326,7 +326,7 @@ async def create_session() -> Optional[str]:
                 conn.execute(
                     "INSERT OR REPLACE INTO sessions (phone, path, created_at, last_used, metadata, session_hash) VALUES (?, ?, ?, ?, ?, ?)",
                     (phone, session_path, datetime.now(timezone.utc).isoformat(), 
-                     datetime.now(timezone.utc).isoformat(), json.dumps(metadata),
+                     datetime.now(timezone.utc).isoformat(), json.dumps(metadata), 
                      sha256(phone.encode()).hexdigest()[:16])
                 )
             print_message("green", "✓", f"Session created for {me.first_name} {me.last_name or ''} ({phone})")
@@ -1038,7 +1038,7 @@ async def main():
         ))
     
     async def update_status():
-        status_table = Table(show=30, box=box.MINIMAL, show_header=False)
+        status_table = Table(box=box.MINIMAL, show_header=False, width=30)
         status_table.add_column("Status", style="white")
         for msg in status_messages[-5:]:
             status_table.add_row(msg)
@@ -1047,7 +1047,6 @@ async def main():
     def add_status_message(style: str, message: str):
         status_messages.append(f"[{style}]{message}[/{style}]")
     
-    # Override print_message to update status
     global print_message
     def print_message(style: str, symbol: str, message: str):
         full_message = f"{symbol} {message}"
