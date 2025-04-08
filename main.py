@@ -2,7 +2,6 @@
 import os
 import asyncio
 import getpass
-import random
 import platform
 import signal
 import sys
@@ -53,7 +52,7 @@ from rich.text import Text
 # Initialize
 console = Console()
 executor = ThreadPoolExecutor(max_workers=4)
-VERSION = "5.4"
+VERSION = "5.5"
 
 # Configure logging
 if not os.path.exists('logs'):
@@ -77,8 +76,8 @@ class SecureConfig:
     
     def _initialize(self):
         self.API_POOL = [
-            {"API_ID": int(os.getenv("TELEGRAM_API_ID", "23077946")), "API_HASH": os.getenv("TELEGRAM_API_HASH", "b6c2b715121435d4aa285c1fb2bc2220")},
-            {"API_ID": 29637547, "API_HASH": "13e303a526522f741c0680cfc8cd9c00"}
+            {"API_ID": 23077946, "API_HASH": "b6c2b715121435d4aa285c1fb2bc2220", "limits": {"last_used": None, "count": 0}},
+            {"API_ID": 29637547, "API_HASH": "13e303a526522f741c0680cfc8cd9c00", "limits": {"last_used": None, "count": 0}}
         ]
         self.SESSION_FOLDER = Path("sessions")
         self.DB_PATH = Path("sessions.db")
@@ -139,8 +138,17 @@ class SecureConfig:
             conn.commit()
             logger.info("Created new sessions database")
 
-    def get_random_api(self):
-        return random.choice(self.API_POOL)
+    async def get_available_api(self) -> Dict[str, Any]:
+        for api in self.API_POOL:
+            if api["limits"]["count"] < 100 or (api["limits"]["last_used"] and (datetime.now(timezone.utc) - api["limits"]["last_used"]).total_seconds() > 3600):
+                # Reset count if an hour has passed since last use
+                if api["limits"]["last_used"] and (datetime.now(timezone.utc) - api["limits"]["last_used"]).total_seconds() > 3600:
+                    api["limits"]["count"] = 0
+                api["limits"]["last_used"] = datetime.now(timezone.utc)
+                api["limits"]["count"] += 1
+                logger.info(f"Using API {api['API_ID']} (count: {api['limits']['count']})")
+                return api
+        raise Exception("All APIs have reached their limits. Please wait and try again later.")
 
 config = SecureConfig()
 
@@ -183,7 +191,7 @@ class AdvancedTelegramClient:
                 console.print(f"[yellow]⚠ Failed to load session file: {e}[/yellow]")
                 logger.warning(f"Failed to load {self.session_path}: {e}")
         
-        api = config.get_random_api()
+        api = await config.get_available_api()
         self.client = TelegramClient(
             session,
             api["API_ID"],
@@ -275,16 +283,16 @@ def print_message(style: str, symbol: str, message: str):
 
 def validate_phone(phone: str) -> bool:
     phone = phone.strip()
-    return phone.startswith('+') and 11 <= len(phone) <= 15 and phone[1:].isdigit()
+    return phone.startswith('+') and 10 <= len(phone) <= 15 and phone[1:].isdigit()
 
 async def create_session() -> Optional[str]:
     print_header("Create New Session")
     while True:
-        phone = Prompt.ask("[cyan]Enter phone number (e.g., +8801720197116, 'q' to quit)[/cyan]", default="+")
+        phone = Prompt.ask("[cyan]Enter phone number (e.g., +919741023014, 'q' to quit)[/cyan]")
         if phone.lower() == 'q':
             return None
         if not validate_phone(phone):
-            print_message("red", "✗", "Invalid format. Use + followed by 10-14 digits")
+            print_message("red", "✗", "Invalid format. Use + followed by 9-14 digits")
             continue
         break
     
@@ -294,7 +302,7 @@ async def create_session() -> Optional[str]:
         if not Confirm.ask("[yellow]Overwrite existing session?[/yellow]"):
             return session_path
     
-    api = config.get_random_api()
+    api = await config.get_available_api()
     session = StringSession()
     async with TelegramClient(session, api["API_ID"], api["API_HASH"]) as client:
         try:
@@ -311,7 +319,7 @@ async def create_session() -> Optional[str]:
                         sent_code = await client(ResendCodeRequest(phone, sent_code.phone_code_hash))
                         print_message("blue", "ℹ", "Code resent successfully")
                         continue
-                    except Exception as e:
+                    except RPCError as e:
                         print_message("red", "✗", f"Failed to resend code: {e}")
                         logger.error(f"Failed to resend code for {phone}: {e}")
                         return None
@@ -357,8 +365,12 @@ async def create_session() -> Optional[str]:
             print_message("green", "✓", f"Session created for {me.first_name} {me.last_name or ''} ({phone})")
             logger.info(f"Session created for {phone} with API {api['API_ID']}")
             return session_path
+        except RPCError as e:
+            print_message("red", "✗", f"Telegram error: {e}")
+            logger.error(f"Telegram error for {phone}: {e}")
+            return None
         except Exception as e:
-            print_message("red", "✗", f"Error: {e}")
+            print_message("red", "✗", f"Unexpected error: {e}")
             logger.error(f"Failed to create session for {phone}: {e}")
             return None
 
@@ -510,7 +522,7 @@ async def update_profile_random_name():
         old_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
         adjectives = ["Cyber", "Quantum", "Neon", "Stealth", "Vortex"]
         nouns = ["Hacker", "Sentinel", "Phantom", "Rogue", "Titan"]
-        new_name = f"{random.choice(adjectives)}{random.choice(nouns)}{random.randint(1000, 9999)}"
+        new_name = f"{adjectives[0]}{nouns[0]}{random.randint(1000, 9999)}"  # Simplified for predictability
         about = Prompt.ask("[cyan]New about text (Enter to skip)[/cyan]", default="")
         await client.safe_execute(UpdateProfileRequest, first_name=new_name, about=about or None)
         print_message("green", "✓", f"Updated from '{old_name}' to '{new_name}'")
