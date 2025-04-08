@@ -24,7 +24,8 @@ from telethon.errors import (
     FloodWaitError,
     PhoneNumberInvalidError,
     PhoneCodeInvalidError,
-    RPCError
+    RPCError,
+    PhoneCodeExpiredError
 )
 from telethon.sessions import StringSession
 from telethon.tl.functions.account import (
@@ -35,6 +36,7 @@ from telethon.tl.functions.account import (
     UpdatePasswordSettingsRequest,
     GetPasswordRequest
 )
+from telethon.tl.functions.auth import ResendCodeRequest
 from telethon.tl.functions.contacts import DeleteContactsRequest, GetContactsRequest
 from telethon.tl.functions.channels import LeaveChannelRequest
 from telethon.tl.functions.messages import GetDialogsRequest
@@ -51,7 +53,7 @@ from rich.text import Text
 # Initialize
 console = Console()
 executor = ThreadPoolExecutor(max_workers=4)
-VERSION = "5.3"
+VERSION = "5.4"
 
 # Configure logging
 if not os.path.exists('logs'):
@@ -301,9 +303,18 @@ async def create_session() -> Optional[str]:
             print_message("blue", "ℹ", f"Sending code to {phone}")
             sent_code = await client.send_code_request(phone)
             for attempt in range(3):
-                code = Prompt.ask("[yellow]Enter code ('q' to quit)[/yellow]", default="q")
+                code = Prompt.ask("[yellow]Enter code received ('q' to quit, 'r' to resend)[/yellow]", default="q")
                 if code.lower() == 'q':
                     return None
+                elif code.lower() == 'r':
+                    try:
+                        sent_code = await client(ResendCodeRequest(phone, sent_code.phone_code_hash))
+                        print_message("blue", "ℹ", "Code resent successfully")
+                        continue
+                    except Exception as e:
+                        print_message("red", "✗", f"Failed to resend code: {e}")
+                        logger.error(f"Failed to resend code for {phone}: {e}")
+                        return None
                 try:
                     await client.sign_in(phone, code, phone_code_hash=sent_code.phone_code_hash)
                     break
@@ -312,10 +323,17 @@ async def create_session() -> Optional[str]:
                     if attempt == 2:
                         print_message("red", "✗", "Too many invalid attempts")
                         return None
+                except PhoneCodeExpiredError:
+                    print_message("red", "✗", "Code expired, please resend")
+                    continue
                 except SessionPasswordNeededError:
                     password = getpass.getpass("Enter 2FA password: ")
-                    await client.sign_in(password=password)
-                    break
+                    try:
+                        await client.sign_in(password=password)
+                        break
+                    except Exception as e:
+                        print_message("red", "✗", f"Invalid 2FA password: {e}")
+                        return None
             
             me = await client.get_me()
             metadata = {
