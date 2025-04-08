@@ -51,7 +51,7 @@ from rich.text import Text
 # Initialize
 console = Console()
 executor = ThreadPoolExecutor(max_workers=4)
-VERSION = "5.2"
+VERSION = "5.3"
 
 # Configure logging
 if not os.path.exists('logs'):
@@ -74,8 +74,10 @@ class SecureConfig:
         return cls._instance
     
     def _initialize(self):
-        self.API_ID = int(os.getenv("TELEGRAM_API_ID", "23077946"))
-        self.API_HASH = os.getenv("TELEGRAM_API_HASH", "b6c2b715121435d4aa285c1fb2bc2220")
+        self.API_POOL = [
+            {"API_ID": int(os.getenv("TELEGRAM_API_ID", "23077946")), "API_HASH": os.getenv("TELEGRAM_API_HASH", "b6c2b715121435d4aa285c1fb2bc2220")},
+            {"API_ID": 29637547, "API_HASH": "13e303a526522f741c0680cfc8cd9c00"}
+        ]
         self.SESSION_FOLDER = Path("sessions")
         self.DB_PATH = Path("sessions.db")
         self.MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
@@ -135,6 +137,9 @@ class SecureConfig:
             conn.commit()
             logger.info("Created new sessions database")
 
+    def get_random_api(self):
+        return random.choice(self.API_POOL)
+
 config = SecureConfig()
 
 @asynccontextmanager
@@ -176,10 +181,11 @@ class AdvancedTelegramClient:
                 console.print(f"[yellow]⚠ Failed to load session file: {e}[/yellow]")
                 logger.warning(f"Failed to load {self.session_path}: {e}")
         
+        api = config.get_random_api()
         self.client = TelegramClient(
             session,
-            config.API_ID,
-            config.API_HASH,
+            api["API_ID"],
+            api["API_HASH"],
             device_model=f"SessionManager-{platform.node()}",
             system_version=platform.system(),
             app_version=VERSION,
@@ -189,7 +195,7 @@ class AdvancedTelegramClient:
         
         for attempt in range(config.MAX_RETRIES):
             try:
-                with console.status("[cyan]Connecting to Telegram...", spinner="dots"):
+                with console.status(f"[cyan]Connecting to Telegram with API {api['API_ID']}...", spinner="dots"):
                     await self.client.connect()
                     if not await self.client.is_user_authorized():
                         console.print(f"[yellow]⚠ Session {self.phone} not authorized[/yellow]")
@@ -202,7 +208,7 @@ class AdvancedTelegramClient:
                             (datetime.now(timezone.utc).isoformat(), self._generate_session_hash(), self.phone)
                         )
                     console.print(f"[green]✓ Connected as {self._me.first_name} (ID: {self._me.id})[/green]")
-                    logger.info(f"Connected to {self.phone}")
+                    logger.info(f"Connected to {self.phone} with API {api['API_ID']}")
                     return True
             except Exception as e:
                 console.print(f"[red]✗ Attempt {attempt + 1} failed: {e}[/red]")
@@ -286,10 +292,11 @@ async def create_session() -> Optional[str]:
         if not Confirm.ask("[yellow]Overwrite existing session?[/yellow]"):
             return session_path
     
+    api = config.get_random_api()
     session = StringSession()
-    async with TelegramClient(session, config.API_ID, config.API_HASH) as client:
+    async with TelegramClient(session, api["API_ID"], api["API_HASH"]) as client:
         try:
-            with console.status("[cyan]Connecting to Telegram...", spinner="dots"):
+            with console.status(f"[cyan]Connecting to Telegram with API {api['API_ID']}...", spinner="dots"):
                 await client.connect()
             print_message("blue", "ℹ", f"Sending code to {phone}")
             sent_code = await client.send_code_request(phone)
@@ -330,7 +337,7 @@ async def create_session() -> Optional[str]:
                      sha256(phone.encode()).hexdigest()[:16])
                 )
             print_message("green", "✓", f"Session created for {me.first_name} {me.last_name or ''} ({phone})")
-            logger.info(f"Session created for {phone}")
+            logger.info(f"Session created for {phone} with API {api['API_ID']}")
             return session_path
         except Exception as e:
             print_message("red", "✗", f"Error: {e}")
@@ -1041,7 +1048,7 @@ async def main():
         status_table = Table(box=box.MINIMAL, show_header=False, width=30)
         status_table.add_column("Status", style="white")
         for msg in status_messages[-5:]:
-            status_table.add_row(msg)
+            status_table.add_row(Text(msg, overflow="fold"))
         layout["status"].update(Panel(status_table, title="Recent Activity", border_style="green"))
 
     def add_status_message(style: str, message: str):
